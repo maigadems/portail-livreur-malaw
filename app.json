@@ -1,0 +1,48 @@
+{
+  "expo": {
+    "name": "Malaw Livreur",
+    "slug": "malaw-livreur",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "userInterfaceStyle": "light",
+    "splash": {
+      "image": "./assets/splash-icon.png",
+      "resizeMode": "contain",
+      "backgroundColor": "#1A3D2B"
+    },
+    "ios": {
+      "supportsTablet": false,
+      "bundleIdentifier": "com.malaw.livreur"
+    },
+    "android": {
+      "adaptiveIcon": {
+        "foregroundImage": "./assets/adaptive-icon.png",
+        "backgroundColor": "#1A3D2B"
+      },
+      "package": "com.malaw.livreur"
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      "expo-font",
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Malaw accède à vos photos pour joindre vos pièces justificatives (CNI, permis, carte grise) et votre photo de profil.",
+          "cameraPermission": "Malaw utilise l'appareil photo pour prendre en photo vos pièces justificatives."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationAlwaysAndWhenInUsePermission": "Malaw suit votre position pendant que vous êtes en ligne, pour vous proposer les courses proches de vous et permettre au client de suivre sa livraison. Le suivi s'arrête dès que vous passez hors ligne.",
+          "locationWhenInUsePermission": "Malaw utilise votre position pour vous proposer les courses proches et guider vos livraisons.",
+          "isAndroidBackgroundLocationEnabled": false,
+          "isIosBackgroundLocationEnabled": false
+        }
+      ]
+    ]
+  }
+}
