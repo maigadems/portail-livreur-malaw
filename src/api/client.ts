@@ -1,7 +1,17 @@
 import AsyncStorage from '@react-native-async-storage/async-storage';
 import { emitSessionExpired } from './sessionEvents';
 
-export const API_URL = 'https://api.malaw.app/api';
+/**
+ * Adresse de l'API.
+ *
+ * Surchargeable par `EXPO_PUBLIC_API_URL` (fichier `.env` à la racine de
+ * l'app) pour viser un backend local pendant le développement, sans toucher
+ * au code. Exemple : EXPO_PUBLIC_API_URL=http://192.168.1.10:3000/api
+ *
+ * Attention sur appareil physique : « localhost » désigne le téléphone
+ * lui-même, il faut l'adresse réseau de la machine de développement.
+ */
+export const API_URL = process.env.EXPO_PUBLIC_API_URL ?? 'https://api.malaw.app/api';
 
 const TOKEN_KEY = '@malaw-livreur/token';
 const REFRESH_KEY = '@malaw-livreur/refreshToken';

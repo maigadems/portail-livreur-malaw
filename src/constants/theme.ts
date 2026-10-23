@@ -9,7 +9,7 @@ export const Colors = {
   creamAlt: '#EAE3D1',
   gold: '#C8963E',
   goldLight: '#F4BD61',
-  goldPale: '#FFDB A5',
+  goldPale: '#FFDBA5',
   white: '#FFFFFF',
   creamText: '#F5F0E2',
   greenLight: '#D0E9D5',

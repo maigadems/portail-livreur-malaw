@@ -1,6 +1,6 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, AppState,
+  View, Text, StyleSheet, TouchableOpacity, ActivityIndicator, AppState, ScrollView,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
@@ -29,13 +29,17 @@ export default function AttenteScreen() {
   const navigation = useNavigation<any>();
   const [payload, setPayload] = useState<ApplicationPayload | null>(null);
   const [loading, setLoading] = useState(true);
-  // Évite de renavigauer en boucle si le polling repasse sur un état final.
+  const [error, setError] = useState<string | null>(null);
+  const [lastCheck, setLastCheck] = useState<Date | null>(null);
+  // Évite de renaviguer en boucle si le polling repasse sur un état final.
   const navigated = useRef(false);
 
   const refresh = useCallback(async () => {
     try {
       const next = await getApplication();
       setPayload(next);
+      setError(null);
+      setLastCheck(new Date());
 
       if (!navigated.current) {
         if (next.application.status === 'APPROVED') {
@@ -48,8 +52,9 @@ export default function AttenteScreen() {
           });
         }
       }
-    } catch {
-      // Hors-ligne : on garde le dernier état connu affiché.
+    } catch (e: any) {
+      // Hors-ligne : on garde le dernier état connu affiché, mais on le dit.
+      setError(e?.message ?? 'Impossible de vérifier votre dossier.');
     } finally {
       setLoading(false);
     }
@@ -87,21 +92,39 @@ export default function AttenteScreen() {
     );
   }
 
+  if (!payload) {
+    return (
+      <SafeAreaView style={[styles.container, styles.centered, { padding: 24, gap: 16 }]}>
+        <Text style={styles.errorText}>{error ?? 'Impossible de vérifier votre dossier.'}</Text>
+        <TouchableOpacity style={styles.retryBtn} onPress={() => { setLoading(true); refresh(); }}>
+          <Text style={styles.retryBtnText}>Réessayer</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => navigation.navigate('ModalDeconnexion')}>
+          <Text style={styles.logoutLink}>Se déconnecter</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       {/* TopAppBar - green */}
       <View style={styles.topBar}>
         <View style={styles.topBarLeft}>
-          <TouchableOpacity style={styles.backBtn} onPress={() => navigation.goBack()}>
-            <Text style={styles.backArrow}>←</Text>
-          </TouchableOpacity>
           <MalawLogo size={40} />
         </View>
-        <LivreurAvatar size={40} />
+        <View style={styles.topBarRight}>
+          {/* L'écran est la racine de la pile (reset après soumission) : la
+              seule sortie légitime est la déconnexion, pas un « retour ». */}
+          <TouchableOpacity style={styles.logoutBtn} onPress={() => navigation.navigate('ModalDeconnexion')}>
+            <Text style={styles.logoutText}>Déconnexion</Text>
+          </TouchableOpacity>
+          <LivreurAvatar size={40} />
+        </View>
       </View>
 
       {/* Main content */}
-      <View style={styles.mainContent}>
+      <ScrollView contentContainerStyle={styles.mainContent} showsVerticalScrollIndicator={false}>
         {/* Illustration */}
         <View style={styles.illustrationSection}>
           <View style={styles.illustrationBg}>
@@ -114,12 +137,27 @@ export default function AttenteScreen() {
         {/* Text — dépend de l'avancement réel du dossier */}
         <View style={styles.textBlock}>
           <Text style={styles.mainTitle}>
-            {application?.status === 'DRAFT' ? 'Dossier à compléter' : 'Candidature envoyée !'}
+            {application?.status === 'DRAFT'
+              ? 'Dossier à compléter'
+              : application?.status === 'UNDER_REVIEW'
+              ? 'Examen en cours'
+              : 'Candidature envoyée !'}
           </Text>
           <Text style={styles.mainDesc}>
             {application?.status === 'DRAFT'
               ? 'Déposez vos documents puis soumettez votre candidature pour validation.'
+              : application?.status === 'UNDER_REVIEW'
+              ? 'Un membre de notre équipe est en train de vérifier vos pièces.'
               : 'Notre équipe examine vos documents pour valider votre compte Malaw.'}
+          </Text>
+          {/* Le livreur sait que l'écran se met à jour seul : sans cela il
+              ferme et rouvre l'app en boucle. */}
+          <Text style={styles.autoRefresh}>
+            {error
+              ? `⚠️ ${error}`
+              : lastCheck
+              ? `Vérification automatique toutes les 20 s · dernière à ${lastCheck.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' })}`
+              : 'Vérification automatique toutes les 20 s'}
           </Text>
         </View>
 
@@ -165,12 +203,12 @@ export default function AttenteScreen() {
           <View style={styles.separator} />
 
           {/* Modify link */}
-          <TouchableOpacity style={styles.modifyLink} onPress={() => navigation.navigate('StatutDocuments')}>
-            <Text style={styles.modifyText}>Modifier mes documents</Text>
+          <TouchableOpacity style={styles.modifyLink} onPress={() => navigation.navigate('Documents')}>
+            <Text style={styles.modifyText}>Voir ou remplacer mes documents</Text>
             <Text style={{ color: Colors.goldLight, fontSize: 16 }}>→</Text>
           </TouchableOpacity>
         </View>
-      </View>
+      </ScrollView>
 
       {/* Footer. La décision vient de l'admin via l'API : l'écran l'observe
           (polling + resynchro au retour au premier plan) et bascule seul vers
@@ -220,21 +258,60 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 16,
   },
-  menuBtn: {
-    width: 34,
-    height: 28,
+  topBarRight: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+  },
+  logoutBtn: {
     borderRadius: 9999,
-    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: 'rgba(245,240,226,0.3)',
+    paddingHorizontal: 12,
+    paddingVertical: 6,
   },
-  backBtn: {
-    width: 34,
-    height: 28,
-    justifyContent: 'center',
-  },
-  backArrow: {
-    fontSize: 22,
+  logoutText: {
+    fontSize: 12,
+    fontWeight: '700',
     color: Colors.cream,
-    fontWeight: '600',
+    fontFamily: 'Manrope_500Medium',
+  },
+  logoutLink: {
+    fontSize: 13,
+    fontWeight: '700',
+    color: Colors.darkGreen,
+    fontFamily: 'Manrope_500Medium',
+    textDecorationLine: 'underline',
+    opacity: 0.7,
+  },
+  errorText: {
+    fontSize: 14,
+    color: Colors.error,
+    textAlign: 'center',
+    fontFamily: 'Manrope_500Medium',
+    lineHeight: 20,
+  },
+  retryBtn: {
+    height: 48,
+    paddingHorizontal: 24,
+    borderRadius: Radii.sm,
+    backgroundColor: Colors.darkGreen,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  retryBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: Colors.cream,
+    fontFamily: 'Manrope_500Medium',
+  },
+  autoRefresh: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: Colors.darkGreen,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    opacity: 0.6,
   },
   topBarLogo: {
     fontSize: 20,
@@ -259,18 +336,19 @@ const styles = StyleSheet.create({
     backgroundColor: Colors.darkGreenTint,
   },
   mainContent: {
-    flex: 1,
+    flexGrow: 1,
     paddingHorizontal: 24,
-    paddingTop: 32,
-    gap: 24,
+    paddingBottom: 24,
+    paddingTop: 24,
+    gap: 20,
   },
   illustrationSection: {
     alignItems: 'center',
   },
   illustrationBg: {
-    width: 288,
-    height: 288,
-    borderRadius: 144,
+    width: 200,
+    height: 200,
+    borderRadius: 100,
     backgroundColor: Colors.darkGreen,
     alignItems: 'center',
     justifyContent: 'center',
@@ -294,13 +372,13 @@ const styles = StyleSheet.create({
     textAlign: 'center',
   },
   mainDesc: {
-    fontSize: 18,
+    fontSize: 16,
     fontWeight: '500',
-    color: 'rgba(193,200,193,1)',
+    color: Colors.darkGreen,
     fontFamily: 'Manrope_500Medium',
     textAlign: 'center',
-    lineHeight: 28,
-    opacity: 0.8,
+    lineHeight: 24,
+    opacity: 0.75,
   },
   statusCard: {
     borderRadius: Radii.lg,
@@ -408,7 +486,7 @@ const styles = StyleSheet.create({
   footerQuestion: {
     fontSize: 12,
     fontWeight: '500',
-    color: Colors.darkGreen,
+    color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
   },
   whatsappBtn: {

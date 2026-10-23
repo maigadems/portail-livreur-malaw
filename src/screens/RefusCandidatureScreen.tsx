@@ -1,25 +1,32 @@
 import React, { useCallback, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity,
-  ScrollView, Dimensions,
+  View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useFocusEffect, useNavigation } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
 import { getApplication, DOCUMENT_LABELS, ApplicationPayload } from '../api/documents';
 
-const { width } = Dimensions.get('window');
-
+/**
+ * Refus de la candidature. Le ton est celui d'une consigne, pas d'une
+ * sanction : le livreur doit repartir d'ici vers le dépôt de ses pièces.
+ * Redéposer une pièce remet le dossier en DRAFT côté serveur ; il faudra
+ * ensuite le soumettre à nouveau depuis l'écran Documents.
+ */
 export default function RefusCandidatureScreen({ route }: any) {
   const navigation = useNavigation<any>();
   const [payload, setPayload] = useState<ApplicationPayload | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useFocusEffect(
     useCallback(() => {
       let active = true;
+      setLoading(true);
       getApplication()
-        .then((p) => { if (active) setPayload(p); })
-        .catch(() => {});
+        .then((p) => { if (active) { setPayload(p); setError(null); } })
+        .catch((e: any) => { if (active) setError(e?.message ?? null); })
+        .finally(() => { if (active) setLoading(false); });
       return () => { active = false; };
     }, []),
   );
@@ -66,15 +73,22 @@ export default function RefusCandidatureScreen({ route }: any) {
         {/* Status badge */}
         <View style={styles.statusBadge}>
           <View style={styles.statusDot} />
-          <Text style={styles.statusText}>CANDIDATURE NON RETENUE</Text>
+          <Text style={styles.statusText}>DOSSIER À CORRIGER</Text>
         </View>
 
         {/* Title */}
-        <Text style={styles.title}>Votre dossier n'a{'\n'}pas été accepté</Text>
+        <Text style={styles.title}>Votre dossier a besoin{'\n'}d'une correction</Text>
         <Text style={styles.subtitle}>
-          Ne vous découragez pas. Vous pouvez corriger les problèmes identifiés
-          et soumettre à nouveau votre candidature.
+          Notre équipe a relevé un ou plusieurs points à corriger. Remplacez les
+          pièces concernées puis soumettez à nouveau votre candidature.
         </Text>
+
+        {loading && !payload && <ActivityIndicator color={Colors.darkGreen} />}
+        {error && !payload && (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
 
         {/* Motifs — réels : celui du dossier, puis pièce par pièce */}
         <View style={styles.motifsSection}>
@@ -106,7 +120,7 @@ export default function RefusCandidatureScreen({ route }: any) {
                 </View>
               </View>
             ))}
-            {!globalReason && motifs.length === 0 && (
+            {!loading && !globalReason && motifs.length === 0 && (
               <View style={styles.motifCard}>
                 <View style={styles.motifLeft}>
                   <View style={styles.motifIconBg}>
@@ -127,9 +141,9 @@ export default function RefusCandidatureScreen({ route }: any) {
         <View style={styles.stepsSection}>
           <Text style={styles.stepsTitle}>COMMENT CORRIGER</Text>
           {[
-            { n: '1', text: 'Lisez attentivement les raisons du refus ci-dessus' },
-            { n: '2', text: 'Préparez les nouveaux documents conformes' },
-            { n: '3', text: 'Soumettez à nouveau via le bouton ci-dessous' },
+            { n: '1', text: 'Lisez les points relevés ci-dessus' },
+            { n: '2', text: 'Remplacez les pièces concernées depuis « Corriger mon dossier »' },
+            { n: '3', text: 'Soumettez à nouveau votre candidature depuis le même écran' },
           ].map((s, i) => (
             <View key={i} style={styles.step}>
               <View style={styles.stepNum}>
@@ -166,7 +180,7 @@ export default function RefusCandidatureScreen({ route }: any) {
           activeOpacity={0.85}
         >
           <View style={styles.primaryBtnShadow} />
-          <Text style={styles.primaryBtnText}>Corriger et soumettre à nouveau</Text>
+          <Text style={styles.primaryBtnText}>Corriger mon dossier</Text>
           <Text style={{ color: Colors.cream, fontSize: 16 }}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
@@ -174,6 +188,9 @@ export default function RefusCandidatureScreen({ route }: any) {
           onPress={() => navigation.navigate('Aide')}
         >
           <Text style={styles.secondaryBtnText}>💬  Contacter le support</Text>
+        </TouchableOpacity>
+        <TouchableOpacity style={styles.logoutLink} onPress={() => navigation.navigate('ModalDeconnexion')}>
+          <Text style={styles.logoutLinkText}>Se déconnecter</Text>
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -399,6 +416,29 @@ const styles = StyleSheet.create({
     paddingHorizontal: 24,
     paddingBottom: 28,
     gap: 10,
+  },
+  logoutLink: { alignItems: 'center', paddingVertical: 6 },
+  logoutLinkText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: Colors.darkGreen,
+    fontFamily: 'Manrope_500Medium',
+    textDecorationLine: 'underline',
+    opacity: 0.6,
+  },
+  errorBox: {
+    width: '100%',
+    borderRadius: Radii.sm,
+    backgroundColor: 'rgba(192,57,43,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(192,57,43,0.25)',
+    padding: 12,
+  },
+  errorText: {
+    fontSize: 13,
+    color: Colors.error,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
   },
   primaryBtn: {
     height: 64,

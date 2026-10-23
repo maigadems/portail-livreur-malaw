@@ -1,38 +1,111 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, ScrollView,
+  View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator,
+  RefreshControl,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
+
 import { Colors, Radii } from '../constants/theme';
 import BottomNavBar from '../components/BottomNavBar';
+import { Alert } from '../components/AppAlert';
+import {
+  listMyReviews, getReviewsSummary, CourierReview, ReviewsSummary,
+} from '../api/reviews';
 
 type RatingFilter = 'Tous' | '5 ⭐' | '4 ⭐' | '< 4 ⭐';
 
-const REVIEWS = [
-  { stars: 5, comment: 'Excellent service, très poli et rapide. Commande parfaite !', date: 'Auj. 14:32', client: 'A. S.', course: 'Almadies → Ouakam' },
-  { stars: 5, comment: 'Livraison à l\'heure, rien ne manquait. Merci !', date: 'Hier 19:20', client: 'M. D.', course: 'Plateau → Médina' },
-  { stars: 4, comment: 'Bonne livraison, juste un peu de retard à cause du trafic.', date: '3 juin', client: 'F. B.', course: 'HLM → Grand Yoff' },
-  { stars: 5, comment: 'Très professionnel, la commande était bien protégée.', date: '2 juin', client: 'K. N.', course: 'Fann → Ouakam' },
-  { stars: 3, comment: 'Correct mais le sac était un peu abîmé à l\'arrivée.', date: '1 juin', client: 'I. T.', course: 'Almadies → Plateau' },
-];
+const FILTERS: RatingFilter[] = ['Tous', '5 ⭐', '4 ⭐', '< 4 ⭐'];
+const PAGE_SIZE = 20;
+
+/** Date d'un avis, au format court français. */
+function formatDate(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  return d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' });
+}
+
+function matchesFilter(review: CourierReview, filter: RatingFilter): boolean {
+  if (filter === '5 ⭐') return review.rating === 5;
+  if (filter === '4 ⭐') return review.rating === 4;
+  if (filter === '< 4 ⭐') return review.rating < 4;
+  return true;
+}
 
 export default function EvaluationsScreen() {
   const navigation = useNavigation<any>();
   const [filter, setFilter] = useState<RatingFilter>('Tous');
-  const filters: RatingFilter[] = ['Tous', '5 ⭐', '4 ⭐', '< 4 ⭐'];
+  const [summary, setSummary] = useState<ReviewsSummary | null>(null);
+  const [reviews, setReviews] = useState<CourierReview[]>([]);
+  const [cursor, setCursor] = useState<string | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
 
-  const avg = (REVIEWS.reduce((a, r) => a + r.stars, 0) / REVIEWS.length).toFixed(1);
+  const load = async () => {
+    const [sum, page] = await Promise.all([
+      getReviewsSummary(),
+      listMyReviews({ limit: PAGE_SIZE }),
+    ]);
+    setSummary(sum);
+    setReviews(page.items);
+    setCursor(page.nextCursor);
+  };
 
-  const filtered = REVIEWS.filter(r => {
-    if (filter === 'Tous') return true;
-    if (filter === '5 ⭐') return r.stars === 5;
-    if (filter === '4 ⭐') return r.stars === 4;
-    if (filter === '< 4 ⭐') return r.stars < 4;
-    return true;
-  });
+  useEffect(() => {
+    let active = true;
+    (async () => {
+      try {
+        await load();
+      } catch (e: any) {
+        if (active) Alert.alert('Avis indisponibles', e?.message ?? 'Réessayez plus tard.');
+      } finally {
+        if (active) setLoading(false);
+      }
+    })();
+    return () => { active = false; };
+  }, []);
 
-  const starCount = (n: number) => REVIEWS.filter(r => r.stars === n).length;
+  const onRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      await load();
+    } catch (e: any) {
+      Alert.alert('Actualisation impossible', e?.message ?? 'Réessayez plus tard.');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const loadMore = async () => {
+    if (!cursor || loadingMore) return;
+    setLoadingMore(true);
+    try {
+      const page = await listMyReviews({ limit: PAGE_SIZE, cursor });
+      // Concaténation : la pagination par curseur ne revient jamais en arrière.
+      setReviews((prev) => [...prev, ...page.items]);
+      setCursor(page.nextCursor);
+    } catch (e: any) {
+      Alert.alert('Chargement impossible', e?.message ?? 'Réessayez plus tard.');
+    } finally {
+      setLoadingMore(false);
+    }
+  };
+
+  const total = summary?.count ?? 0;
+  const average = summary?.average ?? null;
+  const breakdown = summary?.breakdown ?? {};
+  const countFor = (n: number) => Number(breakdown[String(n)] ?? 0);
+  const visible = reviews.filter((r) => matchesFilter(r, filter));
+
+  if (loading) {
+    return (
+      <SafeAreaView style={[styles.container, styles.centered]}>
+        <ActivityIndicator color={Colors.gold} />
+      </SafeAreaView>
+    );
+  }
 
   return (
     <SafeAreaView style={styles.container}>
@@ -44,83 +117,120 @@ export default function EvaluationsScreen() {
         <View style={{ width: 40 }} />
       </View>
 
-      <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        {/* Summary card */}
-        <View style={styles.summaryCard}>
-          <View style={styles.avgBlock}>
-            <Text style={styles.avgValue}>{avg}</Text>
-            <View style={styles.avgStars}>
-              {[1, 2, 3, 4, 5].map(i => (
-                <Text key={i} style={[styles.star, { opacity: parseFloat(avg) >= i ? 1 : 0.3 }]}>⭐</Text>
-              ))}
-            </View>
-            <Text style={styles.avgCount}>{REVIEWS.length} avis</Text>
+      <ScrollView
+        contentContainerStyle={styles.scrollContent}
+        showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.goldLight} />
+        }
+      >
+        {total === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyIcon}>⭐</Text>
+            <Text style={styles.emptyTitle}>Vous n'avez pas encore reçu d'avis</Text>
+            <Text style={styles.emptyDesc}>
+              Les clients peuvent vous noter après chaque livraison. Vos premières évaluations
+              apparaîtront ici.
+            </Text>
           </View>
-
-          <View style={styles.barsBlock}>
-            {[5, 4, 3, 2, 1].map(n => (
-              <View key={n} style={styles.barRow}>
-                <Text style={styles.barLabel}>{n}⭐</Text>
-                <View style={styles.barTrack}>
-                  <View style={[styles.barFill, { width: `${(starCount(n) / REVIEWS.length) * 100}%` as any }]} />
+        ) : (
+          <>
+            {/* Moyenne + répartition, calculées par le serveur sur tous les avis */}
+            <View style={styles.summaryCard}>
+              <View style={styles.avgBlock}>
+                <Text style={styles.avgValue}>{average != null ? average.toFixed(1) : '—'}</Text>
+                <View style={styles.avgStars}>
+                  {[1, 2, 3, 4, 5].map((i) => (
+                    <Text key={i} style={[styles.star, { opacity: (average ?? 0) >= i ? 1 : 0.3 }]}>⭐</Text>
+                  ))}
                 </View>
-                <Text style={styles.barCount}>{starCount(n)}</Text>
+                <Text style={styles.avgCount}>{total} avis</Text>
               </View>
-            ))}
-          </View>
-        </View>
 
-        {/* Highlight */}
-        <View style={styles.highlightCard}>
-          <Text style={styles.highlightIcon}>🏆</Text>
-          <View style={styles.highlightText}>
-            <Text style={styles.highlightTitle}>Top livreur à Dakar</Text>
-            <Text style={styles.highlightDesc}>Vous êtes dans le top 5% des livreurs les mieux notés ce mois-ci</Text>
-          </View>
-        </View>
+              <View style={styles.barsBlock}>
+                {[5, 4, 3, 2, 1].map((n) => (
+                  <View key={n} style={styles.barRow}>
+                    <Text style={styles.barLabel}>{n}⭐</Text>
+                    <View style={styles.barTrack}>
+                      <View style={[styles.barFill, { width: `${(countFor(n) / total) * 100}%` as any }]} />
+                    </View>
+                    <Text style={styles.barCount}>{countFor(n)}</Text>
+                  </View>
+                ))}
+              </View>
+            </View>
 
-        {/* Filters */}
-        <ScrollView horizontal showsHorizontalScrollIndicator={false}>
-          <View style={styles.filterRow}>
-            {filters.map(f => (
+            {summary?.last30dAverage != null && (
+              <View style={styles.recentCard}>
+                <Text style={styles.recentLabel}>Moyenne des 30 derniers jours</Text>
+                <Text style={styles.recentValue}>{summary.last30dAverage.toFixed(1)} ⭐</Text>
+              </View>
+            )}
+
+            {/* Filtres */}
+            <ScrollView horizontal showsHorizontalScrollIndicator={false}>
+              <View style={styles.filterRow}>
+                {FILTERS.map((f) => (
+                  <TouchableOpacity
+                    key={f}
+                    style={[styles.filterPill, filter === f && styles.filterPillActive]}
+                    onPress={() => setFilter(f)}
+                  >
+                    <Text style={[styles.filterText, filter === f && styles.filterTextActive]}>{f}</Text>
+                  </TouchableOpacity>
+                ))}
+              </View>
+            </ScrollView>
+
+            {/* Avis */}
+            <View style={styles.reviewList}>
+              {visible.length === 0 ? (
+                <Text style={styles.noMatch}>Aucun avis ne correspond à ce filtre.</Text>
+              ) : (
+                visible.map((r) => (
+                  <View key={r.id} style={styles.reviewCard}>
+                    <View style={styles.reviewHeader}>
+                      <View style={styles.reviewClient}>
+                        <View style={styles.clientAvatar}>
+                          <Text style={{ fontSize: 18 }}>👤</Text>
+                        </View>
+                        <View style={styles.clientInfo}>
+                          <Text style={styles.clientName}>{r.authorFirstName ?? 'Client anonyme'}</Text>
+                        </View>
+                      </View>
+                      <View style={styles.reviewMeta}>
+                        <View style={styles.starsRow}>
+                          {[1, 2, 3, 4, 5].map((s) => (
+                            <Text key={s} style={[styles.smallStar, s > r.rating && styles.smallStarEmpty]}>⭐</Text>
+                          ))}
+                        </View>
+                        <Text style={styles.reviewDate}>{formatDate(r.createdAt)}</Text>
+                      </View>
+                    </View>
+                    {!!r.comment?.trim() && (
+                      <Text style={styles.reviewComment}>"{r.comment.trim()}"</Text>
+                    )}
+                  </View>
+                ))
+              )}
+            </View>
+
+            {cursor && (
               <TouchableOpacity
-                key={f}
-                style={[styles.filterPill, filter === f && styles.filterPillActive]}
-                onPress={() => setFilter(f)}
+                style={[styles.moreBtn, loadingMore && styles.moreBtnDisabled]}
+                onPress={loadMore}
+                disabled={loadingMore}
+                activeOpacity={0.85}
               >
-                <Text style={[styles.filterText, filter === f && styles.filterTextActive]}>{f}</Text>
+                {loadingMore ? (
+                  <ActivityIndicator color={Colors.goldLight} />
+                ) : (
+                  <Text style={styles.moreBtnText}>Afficher plus d'avis</Text>
+                )}
               </TouchableOpacity>
-            ))}
-          </View>
-        </ScrollView>
-
-        {/* Reviews */}
-        <View style={styles.reviewList}>
-          {filtered.map((r, i) => (
-            <View key={i} style={styles.reviewCard}>
-              <View style={styles.reviewHeader}>
-                <View style={styles.reviewClient}>
-                  <View style={styles.clientAvatar}>
-                    <Text style={{ fontSize: 18 }}>👤</Text>
-                  </View>
-                  <View style={styles.clientInfo}>
-                    <Text style={styles.clientName}>{r.client}</Text>
-                    <Text style={styles.reviewCourse}>{r.course}</Text>
-                  </View>
-                </View>
-                <View style={styles.reviewMeta}>
-                  <View style={styles.starsRow}>
-                    {[1, 2, 3, 4, 5].map(s => (
-                      <Text key={s} style={[styles.smallStar, s > r.stars && styles.smallStarEmpty]}>⭐</Text>
-                    ))}
-                  </View>
-                  <Text style={styles.reviewDate}>{r.date}</Text>
-                </View>
-              </View>
-              <Text style={styles.reviewComment}>"{r.comment}"</Text>
-            </View>
-          ))}
-        </View>
+            )}
+          </>
+        )}
       </ScrollView>
 
       <BottomNavBar active="profil" homeScreen="DashboardEnLigne" />
@@ -130,6 +240,7 @@ export default function EvaluationsScreen() {
 
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: Colors.deepBlack },
+  centered: { alignItems: 'center', justifyContent: 'center' },
   topBar: {
     height: 72,
     backgroundColor: Colors.nearBlack,
@@ -229,31 +340,29 @@ const styles = StyleSheet.create({
     width: 16,
     textAlign: 'center',
   },
-  highlightCard: {
+  recentCard: {
     flexDirection: 'row',
     alignItems: 'center',
-    gap: 14,
+    justifyContent: 'space-between',
     borderRadius: Radii.md,
     backgroundColor: 'rgba(200,150,62,0.08)',
     borderWidth: 1,
     borderColor: 'rgba(200,150,62,0.2)',
-    padding: 14,
+    paddingHorizontal: 16,
+    paddingVertical: 14,
   },
-  highlightIcon: { fontSize: 28 },
-  highlightText: { flex: 1, gap: 3 },
-  highlightTitle: {
-    fontSize: 15,
-    fontWeight: '700',
-    color: Colors.gold,
-    fontFamily: 'Manrope_500Medium',
-  },
-  highlightDesc: {
+  recentLabel: {
     fontSize: 13,
-    fontWeight: '400',
+    fontWeight: '600',
     color: Colors.gold,
     fontFamily: 'Manrope_500Medium',
-    opacity: 0.75,
-    lineHeight: 20,
+    opacity: 0.85,
+  },
+  recentValue: {
+    fontSize: 16,
+    fontWeight: '800',
+    color: Colors.goldLight,
+    fontFamily: 'Manrope_500Medium',
   },
   filterRow: {
     flexDirection: 'row',
@@ -282,6 +391,14 @@ const styles = StyleSheet.create({
     color: 'rgb(67,44,0)',
   },
   reviewList: { gap: 10 },
+  noMatch: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    paddingVertical: 24,
+  },
   reviewCard: {
     borderRadius: Radii.md,
     backgroundColor: Colors.cardDark,
@@ -316,12 +433,6 @@ const styles = StyleSheet.create({
     color: Colors.greenLight,
     fontFamily: 'Manrope_500Medium',
   },
-  reviewCourse: {
-    fontSize: 11,
-    fontWeight: '400',
-    color: Colors.muted,
-    fontFamily: 'Manrope_500Medium',
-  },
   reviewMeta: { alignItems: 'flex-end', gap: 3 },
   starsRow: { flexDirection: 'row', gap: 1 },
   smallStar: { fontSize: 12 },
@@ -338,6 +449,47 @@ const styles = StyleSheet.create({
     color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
     fontStyle: 'italic',
+    lineHeight: 22,
+  },
+  moreBtn: {
+    height: 52,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    borderColor: 'rgba(244,189,97,0.3)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  moreBtnDisabled: { opacity: 0.6 },
+  moreBtnText: {
+    fontSize: 15,
+    fontWeight: '700',
+    color: Colors.goldLight,
+    fontFamily: 'Manrope_500Medium',
+  },
+  emptyCard: {
+    borderRadius: Radii.xxl,
+    backgroundColor: Colors.cardDark,
+    borderWidth: 1,
+    borderColor: 'rgba(65,72,67,0.4)',
+    padding: 32,
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 24,
+  },
+  emptyIcon: { fontSize: 40 },
+  emptyTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: Colors.greenLight,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+  },
+  emptyDesc: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
     lineHeight: 22,
   },
 });

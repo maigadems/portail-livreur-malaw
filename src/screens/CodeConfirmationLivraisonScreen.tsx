@@ -6,7 +6,9 @@ import {
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
+import { Alert } from '../components/AppAlert';
 import { confirmDelivery, getOrder } from '../api/orders';
+import { useCourse } from '../context/CourseContext';
 
 const { width } = Dimensions.get('window');
 const CODE_LENGTH = 4;
@@ -14,7 +16,13 @@ const CODE_LENGTH = 4;
 export default function CodeConfirmationLivraisonScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
-  const { orderId } = route.params ?? {};
+  const { orderId, deliveryId: paramDeliveryId } = route.params ?? {};
+  const { activeDeliveries, refresh } = useCourse();
+  // Un ancien appelant (EnRouteClient) ne transmet que la commande : on
+  // retrouve la course dans le contexte pour que l'écran de fin de course
+  // affiche les vrais chiffres au lieu d'en inventer.
+  const deliveryId: string | undefined =
+    paramDeliveryId ?? activeDeliveries.find((d) => d.order.id === orderId)?.id;
   const [code, setCode] = useState<string[]>(Array(CODE_LENGTH).fill(''));
   const [error, setError] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
@@ -50,13 +58,23 @@ export default function CodeConfirmationLivraisonScreen() {
 
   const handleConfirm = async () => {
     if (verifying) return;
+    if (!orderId) {
+      Alert.alert(
+        'Commande non identifiée',
+        "Cet écran n'a pas reçu la commande à confirmer. Revenez à la course puis réessayez.",
+      );
+      return;
+    }
     const entered = code.join('');
     setVerifying(true);
     try {
       // Vérifié côté serveur (bcrypt contre le hash généré à
       // READY_FOR_PICKUP) — jamais comparé en clair côté client.
       await confirmDelivery(orderId, entered);
-      navigation.replace('ConfirmationLivraison');
+      // La course quitte la liste active : le contexte doit le savoir avant
+      // l'écran de fin, sinon il continuerait de la présenter comme en cours.
+      await refresh().catch(() => {});
+      navigation.replace('ConfirmationLivraison', { deliveryId, orderId });
     } catch (e: any) {
       setError(true);
       setErrorMessage(e?.status === 401 ? 'Code incorrect' : (e?.message ?? 'Code incorrect'));
@@ -182,7 +200,7 @@ export default function CodeConfirmationLivraisonScreen() {
             </TouchableOpacity>
             <TouchableOpacity
               style={styles.cantGetCodeBtn}
-              onPress={() => navigation.navigate('ClientIntrouvable')}
+              onPress={() => navigation.navigate('ClientIntrouvable', { deliveryId, orderId })}
             >
               <Text style={styles.cantGetCodeText}>Le client ne me donne pas le code</Text>
             </TouchableOpacity>

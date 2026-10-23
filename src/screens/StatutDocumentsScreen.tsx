@@ -1,4 +1,4 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator,
 } from 'react-native';
@@ -10,7 +10,11 @@ import {
   DOCUMENT_LABELS,
   ApplicationPayload,
   DocumentItem,
+  DocumentType,
 } from '../api/documents';
+// Même feuille de dépôt que l'écran d'inscription : le renouvellement d'une
+// pièce est exactement le même geste (date d'expiration + photo).
+import { DocumentUploadSheet } from './DocumentsScreen';
 
 type DocStatus = 'valid' | 'expiring' | 'expired' | 'pending' | 'missing' | 'rejected';
 
@@ -43,6 +47,7 @@ function subtitleFor(doc: DocumentItem): string {
   if (doc.status === 'EXPIRED') return 'Document expiré — à renouveler';
   if (doc.status === 'PENDING') return "En attente de validation par notre équipe";
   if (doc.expiringSoon && doc.daysToExpiry != null) {
+    if (doc.daysToExpiry === 0) return "Expire aujourd'hui !";
     return `Expire dans ${doc.daysToExpiry} jour${doc.daysToExpiry > 1 ? 's' : ''} !`;
   }
   if (doc.updatedAt) {
@@ -57,22 +62,42 @@ export default function StatutDocumentsScreen() {
   const navigation = useNavigation<any>();
   const [payload, setPayload] = useState<ApplicationPayload | null>(null);
   const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+  const [sheetType, setSheetType] = useState<DocumentType | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const uploadingRef = useRef(false);
 
-  useFocusEffect(
-    useCallback(() => {
-      let active = true;
-      getApplication()
-        .then((p) => { if (active) setPayload(p); })
-        .catch(() => {})
-        .finally(() => { if (active) setLoading(false); });
-      return () => { active = false; };
-    }, []),
-  );
+  const load = useCallback(async () => {
+    try {
+      setPayload(await getApplication());
+      setError(null);
+    } catch (e: any) {
+      setError(e?.message ?? 'Impossible de charger vos documents.');
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useFocusEffect(useCallback(() => { load(); }, [load]));
+
+  // Même garde que l'écran de dépôt : un envoi en cours ne doit pas être
+  // interrompu par un retour arrière.
+  useEffect(() => { uploadingRef.current = uploading; }, [uploading]);
+  useEffect(() => {
+    const unsub = navigation.addListener('beforeRemove', (e: any) => {
+      if (uploadingRef.current) e.preventDefault();
+    });
+    return unsub;
+  }, [navigation]);
 
   const docs = (payload?.items ?? []).map((d) => ({
     doc: d,
     status: toDisplayStatus(d),
   }));
+  // Les pièces à traiter remontent en tête : c'est pour elles que le livreur
+  // ouvre cet écran quand une notification l'y envoie.
+  const PRIORITY: Record<DocStatus, number> = { expired: 0, rejected: 0, expiring: 1, missing: 2, pending: 3, valid: 4 };
+  docs.sort((a, b) => PRIORITY[a.status] - PRIORITY[b.status]);
   const expiring = docs.filter((d) => d.status === 'expiring').length;
   const expired = docs.filter((d) => d.status === 'expired' || d.status === 'rejected').length;
   const valid = docs.filter((d) => d.status === 'valid').length;
@@ -85,32 +110,61 @@ export default function StatutDocumentsScreen() {
     );
   }
 
+  if (!payload) {
+    return (
+      <SafeAreaView style={[styles.container, styles.centered, { padding: 24, gap: 16 }]}>
+        <Text style={styles.errorText}>{error ?? 'Impossible de charger vos documents.'}</Text>
+        <TouchableOpacity style={styles.retryBtn} onPress={() => { setLoading(true); load(); }}>
+          <Text style={styles.retryBtnText}>Réessayer</Text>
+        </TouchableOpacity>
+        <TouchableOpacity onPress={() => navigation.goBack()}>
+          <Text style={styles.backLink}>Retour</Text>
+        </TouchableOpacity>
+      </SafeAreaView>
+    );
+  }
+
   return (
     <SafeAreaView style={styles.container}>
       <View style={styles.topBar}>
-        <TouchableOpacity onPress={() => navigation.goBack()} style={styles.backBtn}>
+        <TouchableOpacity
+          onPress={() => navigation.goBack()}
+          style={[styles.backBtn, uploading && styles.disabled]}
+          disabled={uploading}
+        >
           <Text style={styles.backArrow}>←</Text>
         </TouchableOpacity>
         <Text style={styles.topBarTitle}>Mes documents</Text>
         <TouchableOpacity
           style={styles.addBtn}
           onPress={() => navigation.navigate('Documents')}
+          disabled={uploading}
         >
-          <Text style={styles.addBtnText}>+ Ajouter</Text>
+          <Text style={styles.addBtnText}>Dossier complet</Text>
         </TouchableOpacity>
       </View>
 
       <ScrollView contentContainerStyle={styles.scrollContent} showsVerticalScrollIndicator={false}>
-        {/* Alert banner */}
+        {error && (
+          <View style={styles.errorBanner}>
+            <Text style={styles.errorBannerText}>{error}</Text>
+          </View>
+        )}
+
+        {/* Alert banner — comptes réels, pièces expirées/refusées d'abord */}
         {(expiring > 0 || expired > 0) && (
           <View style={styles.alertBanner}>
             <Text style={styles.alertIcon}>⚠️</Text>
             <View style={styles.alertText}>
               <Text style={styles.alertTitle}>
-                {expiring > 0 ? `${expiring} document(s) expirent bientôt` : `${expired} document(s) expiré(s)`}
+                {expired > 0
+                  ? `${expired} pièce${expired > 1 ? 's' : ''} à remplacer`
+                  : `${expiring} pièce${expiring > 1 ? 's' : ''} expire${expiring > 1 ? 'nt' : ''} bientôt`}
               </Text>
               <Text style={styles.alertDesc}>
-                Renouvelez-les pour maintenir votre compte actif et éviter une suspension
+                {expired > 0
+                  ? 'Une pièce refusée ou expirée doit être redéposée pour que votre dossier reste conforme.'
+                  : 'Déposez la nouvelle pièce dès que vous l\'avez : elle sera réexaminée par notre équipe.'}
               </Text>
             </View>
           </View>
@@ -140,9 +194,10 @@ export default function StatutDocumentsScreen() {
             return (
               <TouchableOpacity
                 key={doc.type}
-                style={[styles.docCard, { borderColor: `${cfg.color}30` }]}
+                style={[styles.docCard, { borderColor: `${cfg.color}30` }, status === 'expiring' && styles.docCardExpiring]}
                 activeOpacity={0.8}
-                onPress={() => navigation.navigate('Documents')}
+                onPress={() => setSheetType(doc.type)}
+                disabled={uploading}
               >
                 <View style={styles.docLeft}>
                   <View style={[styles.docIconBg, { backgroundColor: cfg.bg }]}>
@@ -171,10 +226,11 @@ export default function StatutDocumentsScreen() {
                   {needsAction && (
                     <TouchableOpacity
                       style={styles.renewBtn}
-                      onPress={() => navigation.navigate('Documents')}
+                      onPress={() => setSheetType(doc.type)}
+                      disabled={uploading}
                     >
                       <Text style={styles.renewBtnText}>
-                        {status === 'missing' ? 'Ajouter' : 'Renouveler'}
+                        {status === 'missing' ? 'Ajouter' : status === 'rejected' ? 'Remplacer' : 'Renouveler'}
                       </Text>
                     </TouchableOpacity>
                   )}
@@ -184,14 +240,31 @@ export default function StatutDocumentsScreen() {
           })}
         </View>
 
-        {/* Info note */}
+        {/* Info note — ce que fait réellement l'app : signaler ici, 30 jours
+            avant. Pas de promesse de notification ou de suspension automatique
+            que le serveur n'implémente pas. */}
         <View style={styles.infoNote}>
           <Text style={styles.infoNoteIcon}>ℹ️</Text>
           <Text style={styles.infoNoteText}>
-            Malaw vous notifie 30 jours avant l'expiration de vos documents. Gardez-les à jour pour éviter la suspension de votre compte.
+            Une pièce est signalée ici 30 jours avant sa date d'expiration. Touchez-la pour déposer la nouvelle version : elle sera réexaminée par notre équipe.
           </Text>
         </View>
       </ScrollView>
+
+      {uploading && (
+        <View style={styles.uploadOverlay}>
+          <ActivityIndicator color={Colors.cream} size="large" />
+          <Text style={styles.uploadOverlayText}>Envoi de votre pièce…</Text>
+          <Text style={styles.uploadOverlaySub}>Ne quittez pas l'écran.</Text>
+        </View>
+      )}
+
+      <DocumentUploadSheet
+        type={sheetType}
+        onClose={() => setSheetType(null)}
+        onUploaded={load}
+        onBusyChange={setUploading}
+      />
     </SafeAreaView>
   );
 }
@@ -368,6 +441,67 @@ const styles = StyleSheet.create({
     alignItems: 'flex-start',
     gap: 8,
     opacity: 0.5,
+  },
+  disabled: { opacity: 0.5 },
+  docCardExpiring: { borderColor: 'rgba(244,189,97,0.5)' },
+  errorBanner: {
+    borderRadius: Radii.sm,
+    backgroundColor: 'rgba(192,57,43,0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,180,171,0.3)',
+    padding: 12,
+  },
+  errorBannerText: {
+    fontSize: 13,
+    color: Colors.errorLight,
+    fontFamily: 'Manrope_500Medium',
+  },
+  errorText: {
+    fontSize: 14,
+    color: Colors.errorLight,
+    textAlign: 'center',
+    fontFamily: 'Manrope_500Medium',
+    lineHeight: 20,
+  },
+  retryBtn: {
+    height: 48,
+    paddingHorizontal: 24,
+    borderRadius: Radii.sm,
+    backgroundColor: Colors.goldLight,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  retryBtnText: {
+    fontSize: 14,
+    fontWeight: '700',
+    color: 'rgb(67,44,0)',
+    fontFamily: 'Manrope_500Medium',
+  },
+  backLink: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+    textDecorationLine: 'underline',
+  },
+  uploadOverlay: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(3,23,12,0.88)',
+    alignItems: 'center',
+    justifyContent: 'center',
+    gap: 12,
+  },
+  uploadOverlayText: {
+    fontSize: 16,
+    fontWeight: '700',
+    color: Colors.cream,
+    fontFamily: 'Manrope_500Medium',
+  },
+  uploadOverlaySub: {
+    fontSize: 13,
+    color: Colors.cream,
+    opacity: 0.7,
+    fontFamily: 'Manrope_500Medium',
   },
   infoNoteIcon: { fontSize: 14 },
   infoNoteText: {

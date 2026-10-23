@@ -1,24 +1,157 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
-  ScrollView, Dimensions,
+  ScrollView, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
+import { Alert } from '../components/AppAlert';
+import {
+  ABANDON_REASONS, AbandonReason, DeliveryDetail, abandonDelivery, getDelivery,
+} from '../api/deliveries';
+import { DisputeCategory, createDispute } from '../api/disputes';
+import { useCourse } from '../context/CourseContext';
 
-const PROBLEMES = [
-  { icon: '🚫', label: 'Restaurant fermé', desc: 'Le restaurant est fermé à l\'arrivée', urgent: true },
-  { icon: '⏳', label: 'Commande non prête', desc: 'Attente de plus de 15 min', urgent: false },
-  { icon: '📦', label: 'Commande incorrecte', desc: 'Articles manquants ou erronés', urgent: true },
-  { icon: '💰', label: 'Désaccord sur le prix', desc: 'Le restaurant demande un paiement supplémentaire', urgent: true },
-  { icon: '☎️', label: 'Restaurant injoignable', desc: 'Aucune réponse du restaurant', urgent: false },
+const DETAILS_MAX = 500;
+
+/**
+ * Chaque problème porte le motif d'abandon du serveur et la catégorie de
+ * litige correspondante : le bouton ne se contente plus de ramener le livreur
+ * au tableau de bord, il relâche vraiment la course.
+ */
+const PROBLEMES: {
+  icon: string;
+  label: string;
+  desc: string;
+  abandon: AbandonReason;
+  dispute: DisputeCategory;
+}[] = [
+  {
+    icon: '🚪',
+    label: 'Restaurant fermé',
+    desc: "Le restaurant est fermé à l'arrivée",
+    abandon: 'RESTAURANT_CLOSED',
+    dispute: 'OTHER',
+  },
+  {
+    icon: '⏰',
+    label: "Commande pas prête",
+    desc: 'Attente prolongée sans commande prête',
+    abandon: 'ORDER_NOT_READY',
+    dispute: 'ORDER_LATE',
+  },
+  {
+    icon: '📦',
+    label: 'Commande incomplète ou erronée',
+    desc: 'Articles manquants ou différents de la commande',
+    abandon: 'RESTAURANT_ISSUE',
+    dispute: 'ORDER_INCOMPLETE',
+  },
+  {
+    icon: '💰',
+    label: 'Désaccord sur le paiement',
+    desc: 'Le restaurant réclame un paiement supplémentaire',
+    abandon: 'RESTAURANT_ISSUE',
+    dispute: 'PAYMENT_ISSUE',
+  },
+  {
+    icon: '☎️',
+    label: 'Restaurant injoignable',
+    desc: 'Personne ne répond sur place ni au téléphone',
+    abandon: 'RESTAURANT_ISSUE',
+    dispute: 'OTHER',
+  },
 ];
+
+const isBlaming = (reason: AbandonReason) =>
+  ABANDON_REASONS.find((r) => r.value === reason)?.blaming ?? true;
 
 export default function ProblemePickupScreen() {
   const navigation = useNavigation<any>();
+  const route = useRoute<any>();
+  const { deliveryId, orderId } = route.params ?? {};
+  const { refresh } = useCourse();
+
+  const [delivery, setDelivery] = useState<DeliveryDetail | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [selected, setSelected] = useState<number | null>(null);
   const [waitedConfirm, setWaitedConfirm] = useState(false);
+  const [submitting, setSubmitting] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    if (!deliveryId) {
+      setLoading(false);
+      setLoadError("Aucune course n'a été transmise à cet écran.");
+      return;
+    }
+    getDelivery(deliveryId)
+      .then((d) => { if (active) setDelivery(d); })
+      .catch((e: any) => {
+        if (active) setLoadError(e?.message ?? 'Impossible de charger la course.');
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [deliveryId]);
+
+  const problem = selected !== null ? PROBLEMES[selected] : null;
+  const ready = problem !== null && waitedConfirm && !submitting;
+
+  const submit = useCallback(async () => {
+    if (!problem || !waitedConfirm || submitting) return;
+    if (!deliveryId) {
+      Alert.alert(
+        'Course non identifiée',
+        "Cet écran n'a pas reçu la course à libérer. Revenez à la course puis réessayez.",
+      );
+      return;
+    }
+    setSubmitting(true);
+
+    const restaurantName = delivery?.order?.restaurant?.name ?? 'le restaurant';
+    const details = [
+      `${problem.label} — ${restaurantName}.`,
+      problem.desc + '.',
+      "Le livreur déclare avoir attendu au moins 5 minutes et tenté de contacter le restaurant.",
+    ].join(' ').slice(0, DETAILS_MAX);
+
+    // Le litige d'abord : après l'abandon, le livreur n'est plus rattaché à
+    // la commande et le serveur refuse son signalement.
+    const targetOrderId = orderId ?? delivery?.order?.id;
+    let disputeError: string | null = null;
+    if (targetOrderId) {
+      try {
+        await createDispute(targetOrderId, {
+          category: problem.dispute,
+          subject: `${problem.label} — ${restaurantName}`.slice(0, 160),
+          description: details,
+        });
+      } catch (e: any) {
+        disputeError = e?.message ?? 'Le signalement au support a échoué.';
+      }
+    }
+
+    try {
+      await abandonDelivery(deliveryId, { reason: problem.abandon, details });
+      await refresh();
+      Alert.alert(
+        'Course libérée',
+        disputeError
+          ? `La course a été rendue au dispatch. En revanche, le signalement au support n'a pas pu être ouvert : ${disputeError}`
+          : 'La course a été rendue au dispatch et le support a reçu votre signalement.',
+        [{ text: 'OK', onPress: () => navigation.replace('DashboardEnLigne') }],
+      );
+    } catch (e: any) {
+      Alert.alert(
+        'Course non libérée',
+        e?.message ?? "Le serveur a refusé l'abandon de la course. Réessayez dans un instant.",
+      );
+    } finally {
+      setSubmitting(false);
+    }
+  }, [problem, waitedConfirm, submitting, deliveryId, orderId, delivery, refresh, navigation]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -34,40 +167,48 @@ export default function ProblemePickupScreen() {
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
-        {/* Context */}
+        {/* Contexte réel de la course */}
         <View style={styles.contextCard}>
           <View style={styles.contextIcon}>
-            <Text style={{ fontSize: 24 }}>🍽️</Text>
+            {loading ? (
+              <ActivityIndicator color={Colors.greenMid} />
+            ) : (
+              <Text style={{ fontSize: 24 }}>🍽️</Text>
+            )}
           </View>
           <View style={styles.contextText}>
-            <Text style={styles.contextName}>Maquis Teranga · Médina</Text>
-            <Text style={styles.contextId}>Commande #MAL-2847</Text>
+            <Text style={styles.contextName}>
+              {loading ? 'Chargement…' : (delivery?.order?.restaurant?.name ?? 'Restaurant')}
+            </Text>
+            {delivery?.order?.restaurant?.address ? (
+              <Text style={styles.contextAddress}>{delivery.order.restaurant.address}</Text>
+            ) : null}
+            {delivery?.order?.items?.length ? (
+              <Text style={styles.contextId}>
+                {delivery.order.items.length} article{delivery.order.items.length > 1 ? 's' : ''} à récupérer
+              </Text>
+            ) : null}
           </View>
         </View>
+
+        {loadError ? <Text style={styles.loadError}>{loadError}</Text> : null}
 
         <Text style={styles.selectTitle}>Quel est le problème ?</Text>
 
         <View style={styles.problemsList}>
           {PROBLEMES.map((p, i) => (
             <TouchableOpacity
-              key={i}
+              key={p.label}
               style={[styles.problemItem, selected === i && styles.problemItemSelected]}
               onPress={() => setSelected(i)}
               activeOpacity={0.75}
             >
               <View style={styles.problemLeft}>
-                <View style={[styles.problemIconBg, p.urgent && styles.problemIconBgUrgent]}>
+                <View style={styles.problemIconBg}>
                   <Text style={styles.problemIconText}>{p.icon}</Text>
                 </View>
                 <View style={styles.problemTextBlock}>
-                  <View style={styles.problemLabelRow}>
-                    <Text style={styles.problemLabel}>{p.label}</Text>
-                    {p.urgent && (
-                      <View style={styles.urgentBadge}>
-                        <Text style={styles.urgentBadgeText}>URGENT</Text>
-                      </View>
-                    )}
-                  </View>
+                  <Text style={styles.problemLabel}>{p.label}</Text>
                   <Text style={styles.problemDesc}>{p.desc}</Text>
                 </View>
               </View>
@@ -78,8 +219,8 @@ export default function ProblemePickupScreen() {
           ))}
         </View>
 
-        {/* Waited confirmation */}
-        {selected !== null && (
+        {/* Déclaration transmise telle quelle au support */}
+        {problem && (
           <TouchableOpacity
             style={[styles.waitedItem, waitedConfirm && styles.waitedItemChecked]}
             onPress={() => setWaitedConfirm(v => !v)}
@@ -93,11 +234,12 @@ export default function ProblemePickupScreen() {
           </TouchableOpacity>
         )}
 
-        {/* Support tip */}
         <View style={styles.supportTip}>
           <Text style={styles.supportTipIcon}>💡</Text>
           <Text style={styles.supportTipText}>
-            Notre équipe prend une décision sous 2 minutes. Votre score ne sera pas affecté.
+            {problem && isBlaming(problem.abandon)
+              ? "Ce motif est retenu dans votre taux de fiabilité."
+              : "La course repartira au dispatch et un litige sera ouvert pour le support. Un problème venant du restaurant n'est pas retenu contre vous."}
           </Text>
         </View>
       </ScrollView>
@@ -111,16 +253,19 @@ export default function ProblemePickupScreen() {
           <Text style={styles.callSupportText}>📞  Appeler le support maintenant</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          style={[styles.reportBtn, (!selected || !waitedConfirm) && styles.reportBtnDisabled]}
-          onPress={() => {
-            if (selected !== null && waitedConfirm) navigation.navigate('DashboardEnLigne');
-          }}
-          activeOpacity={selected !== null && waitedConfirm ? 0.85 : 1}
+          style={[styles.reportBtn, !ready && styles.reportBtnDisabled]}
+          onPress={submit}
+          disabled={!ready}
+          activeOpacity={ready ? 0.85 : 1}
         >
           <View style={styles.reportBtnShadow} />
-          <Text style={[styles.reportBtnText, (!selected || !waitedConfirm) && { opacity: 0.4 }]}>
-            Signaler et annuler la course
-          </Text>
+          {submitting ? (
+            <ActivityIndicator color={Colors.errorLight} />
+          ) : (
+            <Text style={[styles.reportBtnText, !ready && { opacity: 0.4 }]}>
+              Signaler et libérer la course
+            </Text>
+          )}
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -176,11 +321,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  contextText: { gap: 3 },
+  contextText: { gap: 3, flex: 1 },
   contextName: {
     fontSize: 15,
     fontWeight: '700',
     color: Colors.cream,
+    fontFamily: 'Manrope_500Medium',
+  },
+  contextAddress: {
+    fontSize: 12,
+    fontWeight: '400',
+    color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
   },
   contextId: {
@@ -188,6 +339,14 @@ const styles = StyleSheet.create({
     fontWeight: '500',
     color: Colors.goldLight,
     fontFamily: 'Manrope_500Medium',
+  },
+  loadError: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: Colors.errorLight,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    lineHeight: 20,
   },
   selectTitle: {
     fontSize: 18,
@@ -224,35 +383,13 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
-  problemIconBgUrgent: {
-    backgroundColor: 'rgba(192,57,43,0.15)',
-  },
   problemIconText: { fontSize: 22 },
   problemTextBlock: { flex: 1, gap: 3 },
-  problemLabelRow: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-    flexWrap: 'wrap',
-  },
   problemLabel: {
     fontSize: 15,
     fontWeight: '700',
     color: Colors.greenLight,
     fontFamily: 'Manrope_500Medium',
-  },
-  urgentBadge: {
-    borderRadius: 9999,
-    backgroundColor: 'rgba(192,57,43,0.2)',
-    paddingHorizontal: 7,
-    paddingVertical: 2,
-  },
-  urgentBadgeText: {
-    fontSize: 9,
-    fontWeight: '800',
-    color: Colors.errorLight,
-    fontFamily: 'Manrope_500Medium',
-    letterSpacing: 0.5,
   },
   problemDesc: {
     fontSize: 12,

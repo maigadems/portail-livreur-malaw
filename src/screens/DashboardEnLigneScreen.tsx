@@ -1,56 +1,66 @@
-import React, { useState, useCallback, useEffect } from 'react';
+import React, { useState, useCallback, useEffect, useRef } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView, Dimensions, ActivityIndicator,
+  AppState, AppStateStatus,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation, useFocusEffect } from '@react-navigation/native';
+import { useNavigation, useFocusEffect, useIsFocused } from '@react-navigation/native';
 import { Colors, Fonts, Radii } from '../constants/theme';
 import BottomNavBar from '../components/BottomNavBar';
 import MalawLogo from '../components/MalawLogo';
 import LivreurAvatar from '../components/LivreurAvatar';
 import { me } from '../api/auth';
-import { listAvailableDeliveries, setAvailability, getActiveDeliveries, assignDelivery, AvailableDelivery, ActiveDelivery, MAX_ACTIVE_DELIVERIES } from '../api/deliveries';
+import { listAvailableDeliveries, assignDelivery, AvailableDelivery, ActiveDelivery, MAX_ACTIVE_DELIVERIES } from '../api/deliveries';
 import { getEarnings, getProfile, Earnings, CourierProfile } from '../api/couriers';
 import { getIgnoredIds, ignoreDelivery, pruneIgnored } from '../api/ignoredDeliveries';
+import { subscribeCourierFeed } from '../api/realtime';
+import { ApiError } from '../api/client';
+import { useCourse } from '../context/CourseContext';
 import { Alert } from '../components/AppAlert';
-import {
-  getCurrentPosition,
-  hasLocationPermission,
-  requestLocationPermission,
-  startTracking,
-  stopTracking,
-} from '../services/locationTracking';
+import { hasLocationPermission, requestLocationPermission } from '../services/locationTracking';
 
 const { width } = Dimensions.get('window');
 const fmt = (n: number) => n.toLocaleString('fr-FR');
 
+/** Cadence du repli par sondage, tant que le canal temps réel n'est pas confirmé. */
+const POLL_MS = 25_000;
+
 export default function DashboardEnLigneScreen() {
   const navigation = useNavigation<any>();
-  const [status, setStatus] = useState<'online' | 'offline'>('online');
+  const isFocused = useIsFocused();
+  // Disponibilité, courses en cours et suivi GPS appartiennent au contexte :
+  // deux sources de vérité se contrediraient (l'écran croyait le livreur en
+  // ligne alors que le serveur l'avait refusé, et inversement).
+  const {
+    activeDeliveries,
+    current,
+    online,
+    atCapacity,
+    live,
+    loading: serviceLoading,
+    refresh: refreshService,
+    selectCourse,
+    goOnline,
+  } = useCourse();
   const [courierName, setCourierName] = useState('');
   const [courierId, setCourierId] = useState('');
   const [deliveries, setDeliveries] = useState<AvailableDelivery[]>([]);
-  const [activeDeliveries, setActiveDeliveries] = useState<ActiveDelivery[]>([]);
   const [earnings, setEarnings] = useState<Earnings | null>(null);
   const [profile, setProfile] = useState<CourierProfile | null>(null);
   const [loading, setLoading] = useState(true);
   const [accepting, setAccepting] = useState(false);
+  const [goingOnline, setGoingOnline] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const [user, active, items, earn, prof] = await Promise.all([
+      const [user, items, earn, prof] = await Promise.all([
         me(),
-        getActiveDeliveries().catch(() => []),
         listAvailableDeliveries().catch(() => []),
         getEarnings().catch(() => null),
         getProfile().catch(() => null),
       ]);
       setCourierName(user?.name ?? user?.phone ?? '');
       setCourierId(user?.id ?? '');
-      // Les courses en cours (0 à 3) sont affichées en bannière "Reprendre" —
-      // le livreur consulte librement le dashboard tout en ayant des
-      // livraisons actives.
-      setActiveDeliveries(active);
       // Masque les courses que CE livreur a ignorées (choix local persistant)
       // et purge de la liste ignorée celles qui ne sont plus disponibles.
       const ignored = await getIgnoredIds();
@@ -58,9 +68,6 @@ export default function DashboardEnLigneScreen() {
       setDeliveries(items.filter((d) => !ignored.includes(d.id)));
       setEarnings(earn);
       setProfile(prof);
-      // Statut réel depuis le serveur (source de vérité) : à chaque retour
-      // sur le dashboard, ACTIF/INACTIF reflète la vraie disponibilité.
-      if (prof) setStatus(prof.courierAvailable ? 'online' : 'offline');
     } catch (e: any) {
       // Hors-ligne ou session expirée : le dashboard reste utilisable,
       // affiche juste une liste vide.
@@ -69,67 +76,129 @@ export default function DashboardEnLigneScreen() {
     }
   }, []);
 
-  useFocusEffect(useCallback(() => { load(); }, [load]));
+  /** Tout ce que l'écran affiche : sa propre liste + l'état de service. */
+  const reload = useCallback(async () => {
+    await Promise.all([load(), refreshService()]);
+  }, [load, refreshService]);
+
+  useFocusEffect(useCallback(() => { void reload(); }, [reload]));
+
+  // L'alerte plein écran ne doit pas surgir pendant une livraison ni quand le
+  // livreur ne peut de toute façon rien accepter. Un ref évite de réabonner
+  // le canal à chaque changement d'état.
+  const alertGuard = useRef({ canAlert: false });
+  alertGuard.current.canAlert = isFocused && online && !atCapacity && !accepting;
+  // Une même course ne doit alerter qu'une fois, même si le serveur la
+  // repropose (reconnexion, redispatch).
+  const alerted = useRef<Set<string>>(new Set());
 
   /**
-   * Pilote le suivi de position.
-   *  - hors ligne          → aucun suivi
-   *  - en ligne, sans course → un point toutes les 5 min (dispatch par zone)
-   *  - course(s) en cours    → un point toutes les 60 s, poussé au client
-   * Le service ne redémarre rien si le mode n'a pas changé.
+   * Canal temps réel : sans lui, le livreur découvrait les courses en tirant
+   * l'écran vers le bas, et laissait donc passer les premières minutes — qui
+   * sont exactement celles où la course est encore libre.
    */
   useEffect(() => {
-    if (status !== 'online') {
-      stopTracking();
-      return;
-    }
-    let cancelled = false;
-    (async () => {
-      if (!(await hasLocationPermission())) return;
-      if (cancelled) return;
-      if (activeDeliveries.length > 0) {
-        startTracking('delivering', activeDeliveries.map((d) => d.id));
-      } else {
-        startTracking('online');
-      }
-    })();
-    return () => { cancelled = true; };
-  }, [status, activeDeliveries]);
+    const unsubscribe = subscribeCourierFeed({
+      onDeliveryAvailable: (evt) => {
+        void load();
+        if (!evt?.deliveryId || !evt?.orderId) return;
+        if (!alertGuard.current.canAlert || alerted.current.has(evt.deliveryId)) return;
+        alerted.current.add(evt.deliveryId);
+        navigation.navigate('AlerteCourse', {
+          deliveryId: evt.deliveryId,
+          orderId: evt.orderId,
+          earnings: evt.deliveryFee ?? 0,
+          distanceKm: evt.distanceKm,
+        });
+      },
+      onDeliveryTaken: () => { void load(); },
+      onDeliveryCancelled: () => { void reload(); },
+    });
+    return unsubscribe;
+  }, [load, reload, navigation]);
 
-  // Le suivi ne doit pas survivre à la fermeture de l'app.
-  useEffect(() => stopTracking, []);
+  /**
+   * Repli par sondage. Sur mobile le socket meurt en arrière-plan, et certains
+   * réseaux le bloquent purement et simplement : un tableau de bord figé sans
+   * avertissement coûte des courses. Dès que le canal est confirmé, le
+   * sondage s'arrête — inutile de doubler les requêtes.
+   */
+  useEffect(() => {
+    if (live) return;
+    const timer = setInterval(() => { void reload(); }, POLL_MS);
+    return () => clearInterval(timer);
+  }, [live, reload]);
 
-  const toggleStatus = async (next: 'online' | 'offline') => {
-    // INACTIF n'est confirmé qu'APRÈS validation de la pause : on ne change ni
-    // l'état local ni le serveur ici, on ouvre juste l'écran Pause. ACTIF reste
-    // donc en évidence tant que la pause n'est pas validée. Si l'utilisateur
-    // revient sans valider, rien n'a changé.
-    if (next === 'offline') {
-      // Impossible de se mettre en pause avec une course en cours : il faut
-      // d'abord la terminer ou l'annuler.
-      if (activeDeliveries.length > 0) {
-        Alert.alert(
-          'Course en cours',
-          'Vous avez une course en cours. Terminez-la ou annulez-la avant de vous mettre hors ligne.',
-          [{ text: 'Compris' }],
-        );
-        return;
-      }
-      navigation.navigate('Pause');
-      return;
-    }
-    // ACTIF : remise en ligne immédiate.
-    setStatus('online');
+  // Retour au premier plan : l'écran peut avoir plusieurs minutes de retard.
+  useEffect(() => {
+    const onChange = (state: AppStateStatus) => {
+      if (state === 'active') void reload();
+    };
+    const sub = AppState.addEventListener('change', onChange);
+    return () => sub.remove();
+  }, [reload]);
+
+  /**
+   * Hors service, ce tableau de bord n'a plus rien à montrer : aucune course
+   * ne sera proposée. On bascule sur le tableau de bord hors ligne, qui existe
+   * pour ça et porte le bouton de remise en ligne.
+   */
+  useEffect(() => {
+    if (!isFocused || serviceLoading || online || activeDeliveries.length > 0) return;
+    navigation.replace('DashboardHorsLigne');
+  }, [isFocused, serviceLoading, online, activeDeliveries.length, navigation]);
+
+  const handleGoOnline = async () => {
+    if (goingOnline || online) return;
+    setGoingOnline(true);
     try {
       // La position accompagne le passage en ligne : le serveur sait
       // immédiatement dans quelle zone se trouve le livreur, sans attendre
       // le premier ping périodique.
-      const granted = await ensureLocationPermission();
-      const pos = granted ? await getCurrentPosition() : null;
-      await setAvailability(true, pos ?? undefined);
-    } catch {
-      Alert.alert('Disponibilité', "Impossible de mettre à jour votre statut pour le moment.");
+      await ensureLocationPermission();
+      await goOnline();
+    } catch (e: any) {
+      // Le serveur refuse la mise en ligne tant que le dossier de validation
+      // n'est pas approuvé, et son message dit où en est le dossier.
+      const refused = e instanceof ApiError && e.status === 403;
+      Alert.alert(
+        refused ? 'Mise en ligne impossible' : 'Disponibilité',
+        e?.message ?? "Impossible de mettre à jour votre statut pour le moment.",
+        refused
+          ? [
+              { text: 'Plus tard', style: 'cancel' },
+              { text: 'Voir mon dossier', onPress: () => navigation.navigate('StatutDocuments') },
+            ]
+          : [{ text: 'Compris' }],
+      );
+    } finally {
+      setGoingOnline(false);
     }
+  };
+
+  const handleGoOffline = () => {
+    // Une course en cours interdit la pause : il faut la terminer ou
+    // l'abandonner. On donne le moyen de le faire, au lieu de constater.
+    if (activeDeliveries.length > 0) {
+      const target = current ?? activeDeliveries[0];
+      Alert.alert(
+        'Course en cours',
+        'Terminez votre course ou annulez-la avant de vous mettre hors ligne.',
+        [
+          { text: 'Plus tard', style: 'cancel' },
+          {
+            text: 'Annuler la course',
+            style: 'destructive',
+            onPress: () => openAbandon(target),
+          },
+        ],
+      );
+      return;
+    }
+    // Le passage hors ligne n'est confirmé qu'APRÈS validation de la pause :
+    // on ouvre l'écran Pause, qui appelle le contexte. Un retour en arrière
+    // sans validation ne change donc rien.
+    navigation.navigate('Pause');
   };
 
   /**
@@ -150,7 +219,6 @@ export default function DashboardEnLigneScreen() {
     });
   };
 
-  const atCapacity = activeDeliveries.length >= MAX_ACTIVE_DELIVERIES;
   const nearest = deliveries[0];
 
   const ignoreNearest = async () => {
@@ -161,21 +229,39 @@ export default function DashboardEnLigneScreen() {
   };
 
   const openDelivery = (d: ActiveDelivery) => {
+    selectCourse(d.id);
     navigation.navigate(
       d.status === 'IN_TRANSIT' ? 'EnRouteClient' : 'EnRoutePickup',
       { deliveryId: d.id, orderId: d.order.id },
     );
   };
 
+  const openAbandon = (d: ActiveDelivery) => {
+    selectCourse(d.id);
+    navigation.navigate('ModalAnnulationCourse', { deliveryId: d.id, orderId: d.order.id });
+  };
+
   const resumeDeliveries = () => {
     if (activeDeliveries.length === 0) return;
-    // Une seule course en cours → on l'ouvre directement. Plusieurs → on
-    // renvoie vers "Mes livraisons" (liste des courses en cours).
+    // Une seule course en cours → on l'ouvre directement. Plusieurs → le
+    // sélecteur "Mes courses", seul écran qui permet de passer de l'une à
+    // l'autre.
     if (activeDeliveries.length === 1) {
       openDelivery(activeDeliveries[0]);
     } else {
-      navigation.navigate('Historique');
+      navigation.navigate('MesCourses');
     }
+  };
+
+  const cancelActive = () => {
+    if (activeDeliveries.length === 0) return;
+    if (activeDeliveries.length > 1) {
+      // Avec plusieurs courses, c'est au livreur de désigner laquelle il
+      // abandonne : on ne choisit pas à sa place.
+      navigation.navigate('MesCourses');
+      return;
+    }
+    openAbandon(activeDeliveries[0]);
   };
 
   const acceptDelivery = async (delivery: AvailableDelivery) => {
@@ -183,12 +269,14 @@ export default function DashboardEnLigneScreen() {
     setAccepting(true);
     try {
       await assignDelivery(delivery.id, courierId);
+      selectCourse(delivery.id);
+      await refreshService();
       navigation.navigate('EnRoutePickup', { deliveryId: delivery.id, orderId: delivery.order.id });
     } catch (e: any) {
       // Course déjà prise par un autre livreur, ou erreur réseau — on
       // rafraîchit la liste plutôt que de laisser une carte obsolète.
       Alert.alert('Course indisponible', e?.message ?? "Cette course n'est plus disponible.");
-      load();
+      void reload();
     } finally {
       setAccepting(false);
     }
@@ -211,8 +299,8 @@ export default function DashboardEnLigneScreen() {
             <View style={styles.userTextBlock}>
               <Text style={styles.userName}>{courierName || '…'}</Text>
               <View style={styles.statusRow}>
-                <View style={styles.onlineIndicator} />
-                <Text style={styles.onlineBadgeText}>EN LIGNE</Text>
+                <View style={[styles.onlineIndicator, !online && styles.offlineIndicator]} />
+                <Text style={styles.onlineBadgeText}>{online ? 'EN LIGNE' : 'HORS LIGNE'}</Text>
               </View>
             </View>
           </TouchableOpacity>
@@ -222,20 +310,28 @@ export default function DashboardEnLigneScreen() {
         <View style={styles.toggleContainer}>
           <View style={styles.toggleTrack}>
             <TouchableOpacity
-              style={[styles.toggleBtn, status === 'online' && styles.toggleBtnActive]}
-              onPress={() => toggleStatus('online')}
+              style={[styles.toggleBtn, online && styles.toggleBtnActive]}
+              onPress={handleGoOnline}
+              disabled={goingOnline}
             >
-              <View style={[styles.toggleDot, { backgroundColor: Colors.success }]} />
-              <Text style={[styles.toggleText, status === 'online' && styles.toggleTextActive]}>
-                ACTIF
-              </Text>
+              {goingOnline ? (
+                <ActivityIndicator color={Colors.greenMid} />
+              ) : (
+                <>
+                  <View style={[styles.toggleDot, { backgroundColor: Colors.success }]} />
+                  <Text style={[styles.toggleText, online && styles.toggleTextActive]}>
+                    ACTIF
+                  </Text>
+                </>
+              )}
             </TouchableOpacity>
             <TouchableOpacity
-              style={[styles.toggleBtn, status === 'offline' && styles.toggleBtnOffline]}
-              onPress={() => toggleStatus('offline')}
+              style={[styles.toggleBtn, !online && styles.toggleBtnOffline]}
+              onPress={handleGoOffline}
+              disabled={goingOnline}
             >
               <View style={[styles.toggleDot, { backgroundColor: Colors.error }]} />
-              <Text style={[styles.toggleText, status === 'offline' && { color: Colors.greenMid }]}>
+              <Text style={[styles.toggleText, !online && { color: Colors.greenMid }]}>
                 INACTIF
               </Text>
             </TouchableOpacity>
@@ -268,6 +364,14 @@ export default function DashboardEnLigneScreen() {
               <Text style={styles.resumeBtnText}>Reprendre</Text>
               <Text style={styles.resumeBtnArrow}>→</Text>
             </TouchableOpacity>
+            {/* Un livreur bloqué (restaurant fermé, panne) doit pouvoir rendre
+                la course : sans ce lien, il gardait un créneau occupé et ne
+                pouvait plus se mettre hors ligne. */}
+            <TouchableOpacity style={styles.abandonLink} onPress={cancelActive} activeOpacity={0.7}>
+              <Text style={styles.abandonLinkText}>
+                {activeDeliveries.length > 1 ? 'Annuler une course' : 'Annuler cette course'}
+              </Text>
+            </TouchableOpacity>
           </View>
         ) : null}
 
@@ -288,6 +392,15 @@ export default function DashboardEnLigneScreen() {
                 <Text style={styles.seeAllLink}>Voir tout →</Text>
               </TouchableOpacity>
             ) : null}
+          </View>
+
+          {/* État du canal, annoncé sans emphase : une liste figée sans
+              avertissement fait croire qu'il n'y a plus de courses. */}
+          <View style={styles.feedRow}>
+            <View style={[styles.feedDot, !live && styles.feedDotOff]} />
+            <Text style={styles.feedText}>
+              {live ? 'Temps réel' : 'Actualisation toutes les 25 s'}
+            </Text>
           </View>
 
           {loading ? (
@@ -480,6 +593,9 @@ const styles = StyleSheet.create({
     height: 8,
     borderRadius: 4,
     backgroundColor: Colors.success,
+  },
+  offlineIndicator: {
+    backgroundColor: Colors.error,
   },
   onlineBadgeText: {
     fontSize: 11,
@@ -728,6 +844,38 @@ const styles = StyleSheet.create({
     fontFamily: Fonts.epilogue.bold,
   },
   resumeBtnArrow: { fontSize: 18, color: '#13351F' },
+  abandonLink: {
+    alignSelf: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 12,
+  },
+  abandonLinkText: {
+    fontSize: 13,
+    color: Colors.errorLight,
+    fontFamily: Fonts.manrope.semiBold,
+    textDecorationLine: 'underline',
+  },
+  feedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: -8,
+  },
+  feedDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: Colors.success,
+  },
+  feedDotOff: {
+    backgroundColor: Colors.dimText,
+  },
+  feedText: {
+    fontSize: 11,
+    color: Colors.dimText,
+    fontFamily: Fonts.manrope.medium,
+    letterSpacing: 0.3,
+  },
   capacityCard: {
     backgroundColor: Colors.cardDark,
     borderRadius: 16,

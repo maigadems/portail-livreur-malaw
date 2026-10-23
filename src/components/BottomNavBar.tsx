@@ -69,7 +69,10 @@ function IconUser({ color }: { color: string }) {
   );
 }
 
-export default function BottomNavBar({ active, homeScreen = 'DashboardHorsLigne' }: BottomNavBarProps) {
+// Défaut volontairement sur le tableau de bord en ligne : c'est lui qui sait
+// lire l'état réel de disponibilité et rediriger si le livreur est hors
+// ligne. L'inverse renvoyait vers un écran qui ignore l'état du serveur.
+export default function BottomNavBar({ active, homeScreen = 'DashboardEnLigne' }: BottomNavBarProps) {
   const navigation = useNavigation<any>();
 
   const tabs = [

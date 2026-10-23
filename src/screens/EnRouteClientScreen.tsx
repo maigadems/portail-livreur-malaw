@@ -192,7 +192,7 @@ export default function EnRouteClientScreen() {
           </TouchableOpacity>
           <TouchableOpacity
             style={styles.deliveredBtn}
-            onPress={() => navigation.replace('CodeConfirmationLivraison', { orderId })}
+            onPress={() => navigation.replace('CodeConfirmationLivraison', { deliveryId, orderId })}
             activeOpacity={0.85}
           >
             <Text style={styles.deliveredBtnText}>Marquer comme livré</Text>

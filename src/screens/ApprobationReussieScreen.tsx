@@ -1,13 +1,10 @@
 import React, { useEffect, useRef } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity,
-  Animated, Dimensions,
+  View, Text, StyleSheet, TouchableOpacity, Animated,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
-
-const { width } = Dimensions.get('window');
 
 export default function ApprobationReussieScreen() {
   const navigation = useNavigation<any>();
@@ -48,29 +45,31 @@ export default function ApprobationReussieScreen() {
           </Text>
         </Animated.View>
 
-        {/* Info cards */}
+        {/* Ce qui attend le livreur — uniquement des règles réelles de la
+            plateforme (gains crédités par course, retrait à la demande),
+            pas d'horaires ni de zone que le serveur ne connaît pas. */}
         <Animated.View style={[styles.infoCards, { opacity: fadeAnim }]}>
-          <View style={styles.infoCard}>
-            <Text style={styles.infoCardIcon}>🏍️</Text>
-            <View style={styles.infoCardText}>
-              <Text style={styles.infoCardTitle}>Zone de couverture</Text>
-              <Text style={styles.infoCardValue}>Dakar & banlieue</Text>
-            </View>
-          </View>
-          <View style={styles.infoCardDivider} />
           <View style={styles.infoCard}>
             <Text style={styles.infoCardIcon}>💰</Text>
             <View style={styles.infoCardText}>
-              <Text style={styles.infoCardTitle}>Paiement</Text>
-              <Text style={styles.infoCardValue}>Chaque lundi</Text>
+              <Text style={styles.infoCardTitle}>Vos gains</Text>
+              <Text style={styles.infoCardValue}>100 % des frais de livraison, crédités à chaque course livrée</Text>
             </View>
           </View>
           <View style={styles.infoCardDivider} />
           <View style={styles.infoCard}>
-            <Text style={styles.infoCardIcon}>📞</Text>
+            <Text style={styles.infoCardIcon}>🏦</Text>
             <View style={styles.infoCardText}>
-              <Text style={styles.infoCardTitle}>Support disponible</Text>
-              <Text style={styles.infoCardValue}>Lun–Dim 8h–22h</Text>
+              <Text style={styles.infoCardTitle}>Retraits</Text>
+              <Text style={styles.infoCardValue}>À la demande dès 1 000 FCFA, validés par Malaw</Text>
+            </View>
+          </View>
+          <View style={styles.infoCardDivider} />
+          <View style={styles.infoCard}>
+            <Text style={styles.infoCardIcon}>💬</Text>
+            <View style={styles.infoCardText}>
+              <Text style={styles.infoCardTitle}>Besoin d'aide</Text>
+              <Text style={styles.infoCardValue}>Rubrique Aide, depuis votre profil</Text>
             </View>
           </View>
         </Animated.View>
@@ -80,7 +79,7 @@ export default function ApprobationReussieScreen() {
       <View style={styles.bottomArea}>
         <TouchableOpacity
           style={styles.ctaBtn}
-          onPress={() => navigation.replace('Onboarding')}
+          onPress={() => navigation.reset({ index: 0, routes: [{ name: 'Onboarding' }] })}
           activeOpacity={0.85}
         >
           <View style={styles.ctaBtnShadow} />
@@ -88,7 +87,7 @@ export default function ApprobationReussieScreen() {
           <Text style={{ color: Colors.darkGreen, fontSize: 16 }}>→</Text>
         </TouchableOpacity>
         <TouchableOpacity
-          onPress={() => navigation.replace('DashboardEnLigne')}
+          onPress={() => navigation.reset({ index: 0, routes: [{ name: 'DashboardEnLigne' }] })}
           style={styles.skipLink}
         >
           <Text style={styles.skipLinkText}>Passer directement au tableau de bord</Text>
@@ -215,6 +214,7 @@ const styles = StyleSheet.create({
     fontSize: 24,
   },
   infoCardText: {
+    flex: 1,
     gap: 2,
   },
   infoCardTitle: {
@@ -224,10 +224,11 @@ const styles = StyleSheet.create({
     fontFamily: 'Manrope_500Medium',
   },
   infoCardValue: {
-    fontSize: 15,
+    fontSize: 14,
     fontWeight: '700',
     color: Colors.cream,
     fontFamily: 'Manrope_500Medium',
+    lineHeight: 20,
   },
   infoCardDivider: {
     height: 1,

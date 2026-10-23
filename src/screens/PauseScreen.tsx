@@ -1,11 +1,15 @@
-import React, { useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, Dimensions, ScrollView,
+  View, Text, StyleSheet, TouchableOpacity, Dimensions, ScrollView, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { Colors, Radii } from '../constants/theme';
-import { setAvailability } from '../api/deliveries';
+import { ApiError } from '../api/client';
+import { useCourse } from '../context/CourseContext';
+import { Alert } from '../components/AppAlert';
+import { hasLocationPermission, requestLocationPermission } from '../services/locationTracking';
 
 // duration: 0 = pause à durée indéterminée (pas de minuteur).
 const PAUSE_OPTIONS = [
@@ -16,77 +20,206 @@ const PAUSE_OPTIONS = [
   { duration: 120, label: '2 heures', sub: 'Demi-journée' },
 ];
 
-const REASONS = ['Repas', 'Carburant', 'Repos', 'Terminer la journée', 'Autre'];
+/**
+ * La pause ne vit que dans l'app : le serveur ne connaît qu'un livreur hors
+ * ligne. Pour qu'une fermeture de l'app ne perde pas le minuteur, on
+ * mémorise l'échéance (et la durée choisie, pour la barre de progression).
+ * `until = 0` signifie « durée indéterminée ».
+ */
+const PAUSE_KEY = '@malaw-livreur/pauseUntil';
+
+type StoredPause = { until: number; durationMin: number };
 
 const { width } = Dimensions.get('window');
 
+function formatRemaining(ms: number): string {
+  const total = Math.max(0, Math.ceil(ms / 1000));
+  const h = Math.floor(total / 3600);
+  const m = Math.floor((total % 3600) / 60);
+  const s = total % 60;
+  const mm = String(m).padStart(2, '0');
+  const ss = String(s).padStart(2, '0');
+  return h > 0 ? `${h}:${mm}:${ss}` : `${mm}:${ss}`;
+}
+
 export default function PauseScreen() {
   const navigation = useNavigation<any>();
+  // Le passage hors ligne / en ligne appartient au contexte : c'est lui qui
+  // arrête et relance le suivi GPS. Un appel direct au serveur depuis ici
+  // laisserait le suivi tourner pendant la pause.
+  const { online, loading: serviceLoading, goOffline, goOnline } = useCourse();
+
   // "Indéterminée" (0) sélectionnée par défaut.
   const [selected, setSelected] = useState<number>(0);
-  const [reason, setReason] = useState<string | null>(null);
-  const [pauseActive, setPauseActive] = useState(false);
-  const [remainingMin, setRemainingMin] = useState(0);
+  const [pause, setPause] = useState<StoredPause | null>(null);
+  const [hydrated, setHydrated] = useState(false);
+  const [remainingMs, setRemainingMs] = useState(0);
+  const [saving, setSaving] = useState(false);
+  const [resuming, setResuming] = useState(false);
+  const resumingRef = useRef(false);
+
+  /**
+   * Reprise d'une pause laissée en cours. Si le serveur dit que le livreur
+   * est déjà en ligne (remis en service depuis un autre écran, ou autre
+   * téléphone), la pause mémorisée est périmée : on l'efface.
+   */
+  useEffect(() => {
+    if (serviceLoading || hydrated) return;
+    let alive = true;
+    (async () => {
+      const raw = await AsyncStorage.getItem(PAUSE_KEY).catch(() => null);
+      if (!alive) return;
+      if (raw) {
+        if (online) {
+          await AsyncStorage.removeItem(PAUSE_KEY).catch(() => {});
+        } else {
+          try {
+            const parsed = JSON.parse(raw) as StoredPause;
+            if (typeof parsed?.until === 'number') setPause(parsed);
+          } catch {
+            await AsyncStorage.removeItem(PAUSE_KEY).catch(() => {});
+          }
+        }
+      }
+      setHydrated(true);
+    })();
+    return () => { alive = false; };
+  }, [serviceLoading, online, hydrated]);
+
+  // Décompte réel, nettoyé au démontage. Basé sur l'horloge et non sur un
+  // compteur : un intervalle suspendu en arrière-plan reprend au bon endroit.
+  useEffect(() => {
+    if (!pause || pause.until === 0) return;
+    const tick = () => setRemainingMs(pause.until - Date.now());
+    tick();
+    const timer = setInterval(tick, 1000);
+    return () => clearInterval(timer);
+  }, [pause]);
 
   const isIndefinite = selected === 0;
+  const expired = pause != null && pause.until !== 0 && remainingMs <= 0;
 
-  const handleStartPause = () => {
-    setRemainingMin(selected);
-    setPauseActive(true);
-    // C'est ICI que le livreur passe réellement hors ligne (validation de la
-    // pause) — pas au clic sur INACTIF depuis le dashboard.
-    setAvailability(false).catch(() => {});
+  const handleStartPause = async () => {
+    if (saving) return;
+    setSaving(true);
+    try {
+      // C'est ICI que le livreur passe réellement hors ligne (validation de
+      // la pause) — pas au clic sur INACTIF depuis le dashboard.
+      await goOffline();
+      const stored: StoredPause = {
+        until: selected === 0 ? 0 : Date.now() + selected * 60_000,
+        durationMin: selected,
+      };
+      await AsyncStorage.setItem(PAUSE_KEY, JSON.stringify(stored)).catch(() => {});
+      setPause(stored);
+    } catch (e: any) {
+      Alert.alert('Pause impossible', e?.message ?? 'Impossible de vous mettre hors ligne pour le moment.');
+    } finally {
+      setSaving(false);
+    }
   };
 
-  const handleEndPause = () => {
-    setPauseActive(false);
-    // Fin de pause : remise en ligne.
-    setAvailability(true).catch(() => {});
-    navigation.navigate('DashboardEnLigne');
+  const clearPause = useCallback(async () => {
+    await AsyncStorage.removeItem(PAUSE_KEY).catch(() => {});
+    setPause(null);
+  }, []);
+
+  /**
+   * Reprise du service. Toujours à l'initiative du livreur, jamais à
+   * l'expiration du minuteur : se remettre en ligne, c'est s'engager à
+   * accepter des courses, et il faut être là pour ça.
+   */
+  const handleResume = async () => {
+    if (resumingRef.current) return;
+    resumingRef.current = true;
+    setResuming(true);
+    try {
+      if (!(await hasLocationPermission())) await requestLocationPermission();
+      await goOnline();
+      await clearPause();
+      navigation.replace('DashboardEnLigne');
+    } catch (e: any) {
+      // 403 : dossier de validation non approuvé, le message du serveur dit
+      // où il en est.
+      const refused = e instanceof ApiError && e.status === 403;
+      Alert.alert(
+        refused ? 'Mise en ligne impossible' : 'Reprise impossible',
+        e?.message ?? 'Impossible de vous remettre en ligne pour le moment.',
+        refused
+          ? [
+              { text: 'Plus tard', style: 'cancel' },
+              { text: 'Voir mon dossier', onPress: () => navigation.navigate('StatutDocuments') },
+            ]
+          : [{ text: 'Compris' }],
+      );
+    } finally {
+      resumingRef.current = false;
+      setResuming(false);
+    }
   };
 
-  if (pauseActive) {
+  /** Rester hors ligne sans reprendre : on retourne au tableau de bord hors ligne. */
+  const handleStayOffline = async () => {
+    if (resuming) return;
+    await clearPause();
+    navigation.replace('DashboardHorsLigne');
+  };
+
+  if (!hydrated) {
+    return (
+      <SafeAreaView style={styles.container}>
+        <ActivityIndicator color={Colors.goldLight} style={{ marginTop: 60 }} />
+      </SafeAreaView>
+    );
+  }
+
+  if (pause) {
+    const progress = pause.until === 0 || pause.durationMin <= 0
+      ? 0
+      : Math.min(1, Math.max(0, remainingMs / (pause.durationMin * 60_000)));
+
     return (
       <SafeAreaView style={styles.container}>
         <View style={styles.topBar}>
           <View style={{ width: 40 }} />
-          <Text style={styles.topBarTitle}>En pause</Text>
+          <Text style={styles.topBarTitle}>{expired ? 'Pause terminée' : 'En pause'}</Text>
           <View style={{ width: 40 }} />
         </View>
 
         <View style={styles.pauseActiveContent}>
-          {/* Animated pause indicator */}
           <View style={styles.pauseCircle}>
             <View style={styles.pauseCircleInner}>
-              <Text style={styles.pauseIcon}>⏸️</Text>
+              <Text style={styles.pauseIcon}>{expired ? '⏰' : '⏸️'}</Text>
             </View>
           </View>
 
-          <Text style={styles.pauseTitle}>Vous êtes en pause</Text>
+          <Text style={styles.pauseTitle}>
+            {expired ? 'Votre pause est terminée' : 'Vous êtes en pause'}
+          </Text>
           <Text style={styles.pauseDesc}>
-            Aucune course ne vous sera proposée pendant votre pause.{'\n'}
-            Votre score de fiabilité n'est pas affecté.
+            {expired
+              ? 'Vous êtes toujours hors ligne. Reprenez le service quand vous êtes prêt.'
+              : 'Aucune course ne vous sera proposée pendant votre pause.'}
           </Text>
 
-          {/* Timer — masqué pour une pause à durée indéterminée */}
+          {/* Minuteur — masqué pour une pause à durée indéterminée */}
           <View style={styles.timerCard}>
-            {isIndefinite ? (
+            {pause.until === 0 ? (
               <>
                 <Text style={styles.timerLabel}>DURÉE</Text>
                 <Text style={styles.timerValue}>Indéterminée</Text>
               </>
             ) : (
               <>
-                <Text style={styles.timerLabel}>TEMPS RESTANT</Text>
-                <Text style={styles.timerValue}>{remainingMin} min</Text>
+                <Text style={styles.timerLabel}>{expired ? 'ÉCOULÉE' : 'TEMPS RESTANT'}</Text>
+                <Text style={styles.timerValue}>{formatRemaining(remainingMs)}</Text>
                 <View style={styles.timerTrack}>
-                  <View style={[styles.timerFill, { width: `${(remainingMin / selected) * 100}%` as any }]} />
+                  <View style={[styles.timerFill, { width: `${progress * 100}%` as any }]} />
                 </View>
               </>
             )}
           </View>
 
-          {/* Info */}
           <View style={styles.pauseInfoRow}>
             <View style={styles.pauseInfo}>
               <Text style={styles.pauseInfoIcon}>📍</Text>
@@ -100,9 +233,23 @@ export default function PauseScreen() {
         </View>
 
         <View style={styles.bottomArea}>
-          <TouchableOpacity style={styles.endPauseBtn} onPress={handleEndPause} activeOpacity={0.85}>
+          <TouchableOpacity
+            style={[styles.endPauseBtn, resuming && { opacity: 0.7 }]}
+            onPress={handleResume}
+            disabled={resuming}
+            activeOpacity={0.85}
+          >
             <View style={styles.endPauseBtnShadow} />
-            <Text style={styles.endPauseBtnText}>Terminer la pause maintenant</Text>
+            {resuming ? (
+              <ActivityIndicator color={Colors.white} />
+            ) : (
+              <Text style={styles.endPauseBtnText}>
+                {expired ? 'Reprendre le service' : 'Terminer la pause maintenant'}
+              </Text>
+            )}
+          </TouchableOpacity>
+          <TouchableOpacity style={styles.stayOfflineBtn} onPress={handleStayOffline} disabled={resuming}>
+            <Text style={styles.stayOfflineText}>Rester hors ligne</Text>
           </TouchableOpacity>
         </View>
       </SafeAreaView>
@@ -124,15 +271,13 @@ export default function PauseScreen() {
         contentContainerStyle={styles.contentInner}
         showsVerticalScrollIndicator={false}
       >
-        {/* Info */}
         <View style={styles.infoCard}>
           <Text style={styles.infoCardIcon}>💡</Text>
           <Text style={styles.infoCardText}>
-            Pendant votre pause, vous ne recevrez aucune alerte de course. Votre score de fiabilité reste intact.
+            Pendant votre pause, vous ne recevrez aucune alerte de course. À la fin du minuteur, vous restez hors ligne tant que vous n'avez pas repris le service.
           </Text>
         </View>
 
-        {/* Duration selector */}
         <Text style={styles.sectionTitle}>DURÉE DE LA PAUSE</Text>
         <View style={styles.optionsGrid}>
           {PAUSE_OPTIONS.map(opt => (
@@ -164,29 +309,22 @@ export default function PauseScreen() {
             </TouchableOpacity>
           ))}
         </View>
-
-        {/* Raison (optionnel) */}
-        <Text style={styles.sectionTitle}>RAISON (OPTIONNEL)</Text>
-        <View style={styles.reasonRow}>
-          {REASONS.map(r => {
-            const active = reason === r;
-            return (
-              <TouchableOpacity
-                key={r}
-                style={[styles.reasonChip, active && styles.reasonChipActive]}
-                onPress={() => setReason(active ? null : r)}
-                activeOpacity={0.8}
-              >
-                <Text style={[styles.reasonChipText, active && styles.reasonChipTextActive]}>{r}</Text>
-              </TouchableOpacity>
-            );
-          })}
-        </View>
       </ScrollView>
 
       <View style={styles.bottomArea}>
-        <TouchableOpacity style={styles.startPauseBtn} onPress={handleStartPause} activeOpacity={0.85}>
-          <Text style={styles.startPauseBtnText}>Se mettre hors ligne</Text>
+        <TouchableOpacity
+          style={[styles.startPauseBtn, saving && styles.startPauseBtnDisabled]}
+          onPress={handleStartPause}
+          disabled={saving}
+          activeOpacity={0.85}
+        >
+          {saving ? (
+            <ActivityIndicator color={Colors.white} />
+          ) : (
+            <Text style={styles.startPauseBtnText}>
+              {isIndefinite ? 'Se mettre hors ligne' : `Se mettre hors ligne ${PAUSE_OPTIONS.find(o => o.duration === selected)?.label ?? ''}`}
+            </Text>
+          )}
         </TouchableOpacity>
       </View>
     </SafeAreaView>
@@ -308,36 +446,11 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     color: 'rgb(67,44,0)',
   },
-  reasonRow: {
-    flexDirection: 'row',
-    gap: 8,
-    flexWrap: 'wrap',
-  },
-  reasonChip: {
-    borderRadius: 9999,
-    backgroundColor: Colors.cardDark,
-    borderWidth: 1,
-    borderColor: 'rgba(65,72,67,0.4)',
-    paddingHorizontal: 14,
-    paddingVertical: 8,
-  },
-  reasonChipActive: {
-    backgroundColor: 'rgba(244,189,97,0.12)',
-    borderColor: Colors.goldLight,
-  },
-  reasonChipText: {
-    fontSize: 14,
-    fontWeight: '600',
-    color: Colors.muted,
-    fontFamily: 'Manrope_500Medium',
-  },
-  reasonChipTextActive: {
-    color: Colors.goldLight,
-  },
   bottomArea: {
     paddingHorizontal: 24,
     paddingBottom: 28,
     paddingTop: 12,
+    gap: 10,
   },
   startPauseBtn: {
     height: 60,
@@ -419,6 +532,7 @@ const styles = StyleSheet.create({
     fontWeight: '900',
     color: Colors.goldLight,
     fontFamily: 'Manrope_500Medium',
+    fontVariant: ['tabular-nums'],
   },
   timerTrack: {
     width: '100%',
@@ -467,5 +581,17 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: Colors.white,
     fontFamily: 'Manrope_500Medium',
+  },
+  stayOfflineBtn: {
+    height: 48,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  stayOfflineText: {
+    fontSize: 14,
+    fontWeight: '600',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+    textDecorationLine: 'underline',
   },
 });

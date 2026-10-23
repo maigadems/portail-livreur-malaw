@@ -1,18 +1,72 @@
-import React from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
-  Dimensions,
+  Dimensions, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
 import BottomNavBar from '../components/BottomNavBar';
 import MalawLogo from '../components/MalawLogo';
+import { getEarnings, Earnings } from '../api/couriers';
+import { ApiError } from '../api/client';
+import { useCourse } from '../context/CourseContext';
+import { Alert } from '../components/AppAlert';
 
 const { width } = Dimensions.get('window');
+const fmt = (n: number) => n.toLocaleString('fr-FR');
 
+/**
+ * Tableau de bord hors service.
+ *
+ * C'est ici qu'atterrit le livreur dont le serveur dit qu'il n'est pas
+ * disponible. Son bouton changeait autrefois d'écran sans rien dire au
+ * serveur : le livreur se croyait en ligne, aucune course ne lui arrivait,
+ * et il n'avait aucun moyen de comprendre pourquoi.
+ */
 export default function DashboardHorsLigneScreen() {
   const navigation = useNavigation<any>();
+  const { online, goOnline } = useCourse();
+  const [earnings, setEarnings] = useState<Earnings | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [going, setGoing] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      setEarnings(await getEarnings());
+    } catch {
+      // Hors-ligne ou session expirée : on n'affiche simplement aucun chiffre.
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useFocusEffect(useCallback(() => { void load(); }, [load]));
+
+  const handleGoOnline = async () => {
+    if (going) return;
+    setGoing(true);
+    try {
+      await goOnline();
+      navigation.replace('DashboardEnLigne');
+    } catch (e: any) {
+      // Le serveur refuse la mise en ligne tant que le dossier de validation
+      // n'est pas approuvé ; son message précise où en est le dossier.
+      const refused = e instanceof ApiError && e.status === 403;
+      Alert.alert(
+        refused ? 'Mise en ligne impossible' : 'Disponibilité',
+        e?.message ?? "Impossible de vous mettre en ligne pour le moment.",
+        refused
+          ? [
+              { text: 'Plus tard', style: 'cancel' },
+              { text: 'Voir mon dossier', onPress: () => navigation.navigate('StatutDocuments') },
+            ]
+          : [{ text: 'Compris' }],
+      );
+    } finally {
+      setGoing(false);
+    }
+  };
 
   return (
     <SafeAreaView style={styles.container}>
@@ -56,61 +110,47 @@ export default function DashboardHorsLigneScreen() {
           </View>
         </View>
 
-        {/* Weekly summary */}
-        <TouchableOpacity style={styles.weeklySummary} onPress={() => navigation.navigate('DetailsHebdos')} activeOpacity={0.85}>
-          <View style={styles.weeklySummaryInner}>
-            <View style={styles.weeklyLeft}>
-              <Text style={styles.weeklyTotal}>47 300 FCFA</Text>
-              <Text style={styles.weeklyLabel}>Cette semaine</Text>
-              <View style={styles.weeklyBadge}>
-                <Text style={styles.weeklyBadgeText}>+12%</Text>
+        {/* Résumé de la semaine — chiffres réels. Masqué tant qu'on ne les a
+            pas : mieux vaut rien qu'un montant plausible. */}
+        {loading ? (
+          <ActivityIndicator color={Colors.darkGreen} style={{ marginVertical: 16 }} />
+        ) : earnings ? (
+          <TouchableOpacity style={styles.weeklySummary} onPress={() => navigation.navigate('DetailsHebdos')} activeOpacity={0.85}>
+            <View style={styles.weeklySummaryInner}>
+              <View style={styles.weeklyLeft}>
+                <Text style={styles.weeklyTotal}>{fmt(earnings.week.totalXof)} FCFA</Text>
+                <Text style={styles.weeklyLabel}>Cette semaine</Text>
+              </View>
+              <View style={styles.weeklyRight}>
+                <View style={styles.weeklyStatsIcon} />
               </View>
             </View>
-            <View style={styles.weeklyRight}>
-              <View style={styles.weeklyStatsIcon} />
+            <View style={styles.weeklyFooter}>
+              <Text style={styles.weeklyFooterIcon}>🏍️</Text>
+              <Text style={styles.weeklyFooterText}>
+                {earnings.week.count} livraison{earnings.week.count > 1 ? 's' : ''} effectuée{earnings.week.count > 1 ? 's' : ''}
+              </Text>
             </View>
-          </View>
-          <View style={styles.weeklyFooter}>
-            <Text style={styles.weeklyFooterIcon}>🏍️</Text>
-            <Text style={styles.weeklyFooterText}>32 livraisons effectuées</Text>
-          </View>
-        </TouchableOpacity>
+          </TouchableOpacity>
+        ) : null}
 
-        {/* Activity peaks card */}
-        <View style={styles.peaksCard}>
-          <View style={styles.peaksHeader}>
-            <Text style={styles.peaksEmoji}>🔥</Text>
-            <Text style={styles.peaksTitle}>Pics d'activité aujourd'hui</Text>
-          </View>
-          <View style={styles.peaksSlots}>
-            {/* Peak 1 */}
-            <View style={styles.peakSlot}>
-              <Text style={styles.peakTime}>12h - 14h</Text>
-              <Text style={styles.peakEarnings}>+3 800 FCFA</Text>
-            </View>
-            {/* Peak 2 */}
-            <View style={[styles.peakSlot, styles.peakSlotActive]}>
-              <Text style={styles.peakTime}>18h - 21h</Text>
-              <View style={styles.peakSlotRight}>
-                <Text style={styles.peakEarnings}>+5 200 FCFA</Text>
-                <View style={styles.peakArrow}>
-                  <Text style={{ color: 'rgb(67,44,0)', fontSize: 14 }}>→</Text>
-                </View>
-              </View>
-            </View>
-          </View>
-          <Text style={styles.peaksFooter}>Gagnez jusqu'à 2x plus durant ces créneaux</Text>
-        </View>
-
-        {/* Go online button */}
+        {/* Le passage en ligne va au serveur via le contexte : changer d'écran
+            sans lui parler laissait le livreur croire qu'il était en service. */}
         <TouchableOpacity
-          style={styles.goOnlineBtn}
-          onPress={() => navigation.replace('DashboardEnLigne')}
+          style={[styles.goOnlineBtn, going && { opacity: 0.7 }]}
+          onPress={handleGoOnline}
+          disabled={going}
           activeOpacity={0.85}
         >
           <View style={styles.goOnlineBtnShadow} />
-          <Text style={styles.goOnlineText}>Me mettre en ligne</Text>
-          <Text style={{ color: Colors.cream, fontSize: 16 }}>→</Text>
+          {going ? (
+            <ActivityIndicator color={Colors.cream} />
+          ) : (
+            <>
+              <Text style={styles.goOnlineText}>Me mettre en ligne</Text>
+              <Text style={{ color: Colors.cream, fontSize: 16 }}>→</Text>
+            </>
+          )}
         </TouchableOpacity>
       </ScrollView>
 
@@ -258,20 +298,6 @@ const styles = StyleSheet.create({
     fontFamily: 'Manrope_500Medium',
     opacity: 0.7,
   },
-  weeklyBadge: {
-    marginTop: 4,
-    backgroundColor: Colors.darkGreen,
-    borderRadius: 9999,
-    paddingHorizontal: 10,
-    paddingVertical: 4,
-    alignSelf: 'flex-start',
-  },
-  weeklyBadgeText: {
-    fontSize: 12,
-    fontWeight: '700',
-    color: Colors.cream,
-    fontFamily: 'Manrope_500Medium',
-  },
   weeklyRight: {
     width: 80,
     height: 80,
@@ -298,76 +324,6 @@ const styles = StyleSheet.create({
     fontWeight: '700',
     color: Colors.darkGreen,
     fontFamily: 'Manrope_500Medium',
-  },
-  peaksCard: {
-    borderRadius: Radii.lg,
-    backgroundColor: Colors.white,
-    borderWidth: 1,
-    borderColor: Colors.darkGreen,
-    padding: 24,
-    gap: 16,
-  },
-  peaksHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  peaksEmoji: {
-    fontSize: 24,
-  },
-  peaksTitle: {
-    fontSize: 18,
-    fontWeight: '700',
-    color: Colors.darkGreen,
-    fontFamily: 'Manrope_500Medium',
-  },
-  peaksSlots: {
-    gap: 8,
-  },
-  peakSlot: {
-    borderRadius: Radii.sm,
-    backgroundColor: Colors.goldLight,
-    paddingHorizontal: 16,
-    paddingVertical: 12,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  peakSlotActive: {
-    backgroundColor: Colors.goldLight,
-  },
-  peakTime: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: 'rgb(67,44,0)',
-    fontFamily: 'Manrope_500Medium',
-  },
-  peakEarnings: {
-    fontSize: 16,
-    fontWeight: '800',
-    color: 'rgb(67,44,0)',
-    fontFamily: 'Manrope_500Medium',
-  },
-  peakSlotRight: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  peakArrow: {
-    width: 32,
-    height: 32,
-    borderRadius: 8,
-    backgroundColor: Colors.white,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  peaksFooter: {
-    fontSize: 12,
-    fontWeight: '500',
-    color: Colors.darkGreen,
-    fontFamily: 'Manrope_500Medium',
-    textAlign: 'center',
-    opacity: 0.7,
   },
   goOnlineBtn: {
     height: 64,

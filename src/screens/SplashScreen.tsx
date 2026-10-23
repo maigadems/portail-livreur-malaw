@@ -4,28 +4,68 @@ import { useNavigation } from '@react-navigation/native';
 import { LinearGradient } from 'expo-linear-gradient';
 import { Colors } from '../constants/theme';
 import { getStoredUser } from '../api/client';
+import { getApplication, ApplicationStatus } from '../api/documents';
 
-const { width, height } = Dimensions.get('window');
+const { height } = Dimensions.get('window');
+
+/** Durée d'affichage minimale du logo — le temps de l'animation d'accueil. */
+const SPLASH_MS = 1500;
+/**
+ * Délai maximal accordé à l'appel de statut du dossier. Au-delà, on entre
+ * sur le tableau de bord : un serveur lent ne doit pas bloquer le démarrage
+ * (les gardes serveur refuseront de toute façon une action interdite).
+ */
+const APPLICATION_TIMEOUT_MS = 3000;
+
+/**
+ * Écran d'entrée selon l'état réel du dossier KYC. Un livreur non validé ne
+ * doit pas arriver sur un tableau de bord qui lui refuse tout sans expliquer.
+ */
+function routeForStatus(status: ApplicationStatus): string {
+  switch (status) {
+    case 'DRAFT': return 'Documents';
+    case 'SUBMITTED':
+    case 'UNDER_REVIEW': return 'Attente';
+    case 'REJECTED': return 'RefusCandidature';
+    case 'APPROVED':
+    default: return 'DashboardEnLigne';
+  }
+}
+
+async function resolveEntryRoute(): Promise<string> {
+  const user = await getStoredUser().catch(() => null);
+  if (!user) return 'Connexion';
+
+  // Promise.race : l'appel réseau n'a pas le droit de retarder le démarrage
+  // au-delà du délai. Hors ligne ou serveur lent → tableau de bord.
+  const timeout = new Promise<null>((resolve) => setTimeout(() => resolve(null), APPLICATION_TIMEOUT_MS));
+  const payload = await Promise.race([getApplication().catch(() => null), timeout]);
+  if (!payload) {
+    // Un 401 définitif a pu effacer la session pendant l'appel (jeton de
+    // rafraîchissement périmé) : dans ce cas, c'est Connexion, pas le dashboard.
+    const stillLogged = await getStoredUser().catch(() => null);
+    return stillLogged ? 'DashboardEnLigne' : 'Connexion';
+  }
+  return routeForStatus(payload.application.status);
+}
 
 export default function SplashScreen() {
   const navigation = useNavigation<any>();
 
   useEffect(() => {
-    // Une session existe déjà sur l'appareil (connexion précédente) : on saute
-    // directement au dashboard plutôt que de rejouer Inscription/Connexion à
-    // chaque relance — même logique que le portail-client.
+    // Une session existe déjà sur l'appareil (connexion précédente) : on
+    // aiguille directement selon le dossier plutôt que de rejouer
+    // Inscription/Connexion à chaque relance.
     let active = true;
-    const timer = setTimeout(async () => {
-      const user = await getStoredUser().catch(() => null);
+    const minDelay = new Promise<void>((resolve) => setTimeout(resolve, SPLASH_MS));
+
+    Promise.all([resolveEntryRoute(), minDelay]).then(([route]) => {
       if (!active) return;
       // reset : la destination devient la racine de la pile (pas de Splash
       // en dessous), donc aucun "retour" ne revient sur le Splash/Connexion.
-      navigation.reset({
-        index: 0,
-        routes: [{ name: user ? 'DashboardEnLigne' : 'Connexion' }],
-      });
-    }, 2800);
-    return () => { active = false; clearTimeout(timer); };
+      navigation.reset({ index: 0, routes: [{ name: route }] });
+    });
+    return () => { active = false; };
   }, []);
 
   return (

@@ -1,7 +1,6 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useMemo, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, ScrollView,
-  Dimensions, ActivityIndicator,
+  View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
@@ -9,54 +8,114 @@ import { Colors, Radii } from '../constants/theme';
 import BottomNavBar from '../components/BottomNavBar';
 import MalawLogo from '../components/MalawLogo';
 import LivreurAvatar from '../components/LivreurAvatar';
-import { getEarnings, getMyDeliveries, Earnings } from '../api/couriers';
+import { Alert } from '../components/AppAlert';
+import { getEarnings, getMyDeliveries, Earnings, CourierDelivery } from '../api/couriers';
 
 const fmt = (n: number) => n.toLocaleString('fr-FR');
 const DAY_NAMES = ['Dim', 'Lun', 'Mar', 'Mer', 'Jeu', 'Ven', 'Sam'];
+const CHART_HEIGHT = 120;
 
-type DayStat = { key: string; day: string; courses: number; earnings: number };
+type DayStat = { key: string; day: string; date: number; courses: number; earnings: number };
+
+/** Dimanche 00:00 de la semaine visée, comme le calcul des gains côté serveur. */
+function startOfWeek(offset: number): Date {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  d.setDate(d.getDate() - d.getDay() - offset * 7);
+  return d;
+}
+
+const fmtDayMonth = (d: Date) =>
+  d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' });
 
 export default function DetailsHebdosScreen() {
   const navigation = useNavigation<any>();
   const [earnings, setEarnings] = useState<Earnings | null>(null);
-  const [days, setDays] = useState<DayStat[]>([]);
+  const [deliveries, setDeliveries] = useState<CourierDelivery[]>([]);
   const [loading, setLoading] = useState(true);
+  // 0 = semaine en cours, 1 = semaine précédente, etc.
+  const [weekOffset, setWeekOffset] = useState(0);
 
   useFocusEffect(useCallback(() => {
     let active = true;
-    Promise.all([getEarnings().catch(() => null), getMyDeliveries().catch(() => [])])
-      .then(([earn, deliveries]) => {
+    Promise.all([getEarnings(), getMyDeliveries()])
+      .then(([earn, list]) => {
         if (!active) return;
         setEarnings(earn);
-        // Début de la semaine (dimanche 00:00), comme le backend earnings.
-        const startOfWeek = new Date();
-        startOfWeek.setHours(0, 0, 0, 0);
-        startOfWeek.setDate(startOfWeek.getDate() - startOfWeek.getDay());
-        // Agrège les livraisons livrées de la semaine par jour.
-        const map = new Map<string, DayStat>();
-        deliveries
-          .filter((d) => d.status === 'DELIVERED' && d.deliveredAt && new Date(d.deliveredAt) >= startOfWeek)
-          .forEach((d) => {
-            const date = new Date(d.deliveredAt!);
-            const key = date.toDateString();
-            const label = `${DAY_NAMES[date.getDay()]} ${date.getDate()}`;
-            const cur = map.get(key) ?? { key, day: label, courses: 0, earnings: 0 };
-            cur.courses += 1;
-            cur.earnings += d.order.deliveryFee;
-            map.set(key, cur);
-          });
-        setDays([...map.values()].sort((a, b) => Date.parse(b.key) - Date.parse(a.key)));
+        setDeliveries(list);
+      })
+      .catch((e: any) => {
+        if (active) Alert.alert('Gains indisponibles', e?.message ?? 'Réessayez dans un instant.');
       })
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, []));
 
-  const weekTotal = earnings?.week.totalXof ?? 0;
-  const weekCount = earnings?.week.count ?? 0;
+  const delivered = useMemo(
+    () => deliveries.filter((d) => d.status === 'DELIVERED' && d.deliveredAt),
+    [deliveries],
+  );
+
+  const weekStart = useMemo(() => startOfWeek(weekOffset), [weekOffset]);
+  const weekEnd = useMemo(() => {
+    const d = new Date(weekStart);
+    d.setDate(d.getDate() + 7);
+    return d;
+  }, [weekStart]);
+
+  // Sept cases pleines : un jour sans course reste visible, à zéro.
+  const days = useMemo<DayStat[]>(() => {
+    const slots: DayStat[] = Array.from({ length: 7 }, (_, i) => {
+      const d = new Date(weekStart);
+      d.setDate(d.getDate() + i);
+      return {
+        key: d.toDateString(),
+        day: DAY_NAMES[d.getDay()],
+        date: d.getDate(),
+        courses: 0,
+        earnings: 0,
+      };
+    });
+    const byKey = new Map(slots.map((s) => [s.key, s]));
+    delivered.forEach((d) => {
+      const date = new Date(d.deliveredAt!);
+      if (date < weekStart || date >= weekEnd) return;
+      const slot = byKey.get(date.toDateString());
+      if (!slot) return;
+      slot.courses += 1;
+      slot.earnings += d.order.deliveryFee;
+    });
+    return slots;
+  }, [delivered, weekStart, weekEnd]);
+
+  const computedTotal = days.reduce((acc, d) => acc + d.earnings, 0);
+  const computedCount = days.reduce((acc, d) => acc + d.courses, 0);
+
+  // Pour la semaine en cours, le serveur fait foi ; les semaines passées sont
+  // reconstituées depuis l'historique de livraisons.
+  const weekTotal = weekOffset === 0 ? (earnings?.week.totalXof ?? computedTotal) : computedTotal;
+  const weekCount = weekOffset === 0 ? (earnings?.week.count ?? computedCount) : computedCount;
+
+  const maxDay = Math.max(...days.map((d) => d.earnings), 0);
+
+  // On ne remonte pas plus loin que l'historique réellement disponible.
+  const oldestDelivery = useMemo(() => {
+    const times = delivered.map((d) => Date.parse(d.deliveredAt!));
+    return times.length ? Math.min(...times) : null;
+  }, [delivered]);
+  const canGoBack = oldestDelivery !== null && oldestDelivery < weekStart.getTime();
+  const canGoForward = weekOffset > 0;
+
+  const weekLabel = weekOffset === 0
+    ? 'Cette semaine'
+    : weekOffset === 1
+      ? 'Semaine dernière'
+      : `Il y a ${weekOffset} semaines`;
+
+  const rangeLabel = `${fmtDayMonth(weekStart)} — ${fmtDayMonth(new Date(weekEnd.getTime() - 86400000))}`;
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* TopAppBar */}
       <View style={styles.topBar}>
         <View style={styles.topBarLeft}>
           <MalawLogo size={40} />
@@ -69,16 +128,34 @@ export default function DetailsHebdosScreen() {
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
       >
-        {/* Week selector */}
+        {/* Navigation entre semaines */}
         <View style={styles.weekSelector}>
-          <Text style={styles.weekTitle}>Gains de la semaine</Text>
+          <TouchableOpacity
+            style={[styles.weekNavBtn, !canGoBack && styles.weekNavBtnDisabled]}
+            onPress={() => setWeekOffset((o) => o + 1)}
+            disabled={!canGoBack}
+            activeOpacity={0.85}
+          >
+            <Text style={[styles.weekNavArrow, !canGoBack && styles.weekNavArrowDisabled]}>←</Text>
+          </TouchableOpacity>
+          <View style={styles.weekTitleBlock}>
+            <Text style={styles.weekTitle}>{weekLabel}</Text>
+            <Text style={styles.weekRange}>{rangeLabel}</Text>
+          </View>
+          <TouchableOpacity
+            style={[styles.weekNavBtn, !canGoForward && styles.weekNavBtnDisabled]}
+            onPress={() => setWeekOffset((o) => Math.max(0, o - 1))}
+            disabled={!canGoForward}
+            activeOpacity={0.85}
+          >
+            <Text style={[styles.weekNavArrow, !canGoForward && styles.weekNavArrowDisabled]}>→</Text>
+          </TouchableOpacity>
         </View>
 
         {loading ? (
           <ActivityIndicator color={Colors.goldLight} style={{ marginVertical: 32 }} />
         ) : (
         <>
-        {/* Summary card - forest green */}
         <View style={styles.summaryCard}>
           <View style={styles.summaryCardDecor} />
           <View style={styles.summaryContent}>
@@ -95,28 +172,68 @@ export default function DetailsHebdosScreen() {
           </View>
         </View>
 
-        {/* Daily table */}
-        <View style={styles.dailyTable}>
-          <Text style={styles.dailyTableTitle}>Activité Quotidienne</Text>
-          {days.length === 0 ? (
-            <Text style={styles.emptyDay}>Aucune course livrée cette semaine.</Text>
+        {/* Barres proportionnelles au meilleur jour de la semaine */}
+        <View style={styles.chartCard}>
+          <Text style={styles.chartTitle}>Répartition par jour</Text>
+          {maxDay === 0 ? (
+            <Text style={styles.emptyDay}>Aucune course livrée sur cette semaine.</Text>
           ) : (
-            <View style={styles.dayRows}>
-              {days.map((day) => (
-                <View key={day.key} style={styles.dayRow}>
-                  <View style={styles.dayRowLeft}>
-                    <Text style={styles.dayName}>{day.day}</Text>
-                  </View>
-                  <View style={styles.dayRowRight}>
-                    <View style={styles.dayCoursePill}>
-                      <Text style={styles.dayCourses}>{day.courses} course{day.courses > 1 ? 's' : ''}</Text>
+            <View style={styles.chart}>
+              {days.map((d) => {
+                const ratio = d.earnings / maxDay;
+                return (
+                  <View key={d.key} style={styles.chartColumn}>
+                    <Text style={styles.chartValue}>
+                      {d.earnings > 0 ? fmt(d.earnings) : ''}
+                    </Text>
+                    <View style={styles.chartBarTrack}>
+                      <View
+                        style={[
+                          styles.chartBar,
+                          {
+                            height: Math.max(d.earnings > 0 ? 6 : 2, Math.round(CHART_HEIGHT * ratio)),
+                            backgroundColor: d.earnings === maxDay ? Colors.goldLight : Colors.greenMid,
+                          },
+                        ]}
+                      />
                     </View>
-                    <Text style={styles.dayEarnings}>{fmt(day.earnings)} FCFA</Text>
+                    <Text style={styles.chartDay}>{d.day}</Text>
+                    <Text style={styles.chartDate}>{d.date}</Text>
                   </View>
-                </View>
-              ))}
+                );
+              })}
             </View>
           )}
+        </View>
+
+        <View style={styles.dailyTable}>
+          <Text style={styles.dailyTableTitle}>Activité quotidienne</Text>
+          {computedCount === 0 ? (
+            <Text style={styles.emptyDay}>Aucune course livrée sur cette semaine.</Text>
+          ) : (
+            <View style={styles.dayRows}>
+              {days
+                .filter((d) => d.courses > 0)
+                .map((day) => (
+                  <View key={day.key} style={styles.dayRow}>
+                    <View style={styles.dayRowLeft}>
+                      <Text style={styles.dayName}>{day.day} {day.date}</Text>
+                    </View>
+                    <View style={styles.dayRowRight}>
+                      <View style={styles.dayCoursePill}>
+                        <Text style={styles.dayCourses}>
+                          {day.courses} course{day.courses > 1 ? 's' : ''}
+                        </Text>
+                      </View>
+                      <Text style={styles.dayEarnings}>{fmt(day.earnings)} FCFA</Text>
+                    </View>
+                  </View>
+                ))}
+            </View>
+          )}
+          <Text style={styles.tableNote}>
+            Détail reconstitué à partir de vos dernières livraisons.
+          </Text>
         </View>
         </>
         )}
@@ -145,43 +262,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     gap: 16,
   },
-  backBtn: {
-    justifyContent: 'center',
-    width: 34,
-    height: 28,
-  },
-  backArrow: {
-    fontSize: 22,
-    color: Colors.cream,
-    fontWeight: '600',
-  },
-  hamburgerLine: {
-    width: 18,
-    height: 2,
-    backgroundColor: Colors.cream,
-    borderRadius: 1,
-  },
-  logoText: {
-    fontSize: 24,
-    fontWeight: '900',
-    color: Colors.cream,
-    fontFamily: 'Manrope_500Medium',
-  },
-  avatarBorder: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    borderWidth: 2,
-    borderColor: Colors.gold,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  avatarInner: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: Colors.darkGreenTint,
-  },
   scrollArea: {
     flex: 1,
   },
@@ -195,21 +275,36 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     alignItems: 'center',
     justifyContent: 'space-between',
+    gap: 12,
   },
+  weekTitleBlock: { flex: 1, alignItems: 'center', gap: 2 },
   weekTitle: {
     fontSize: 20,
     fontWeight: '700',
     color: Colors.greenLight,
     fontFamily: 'Manrope_500Medium',
   },
-  calendarBtn: {
-    width: 34,
-    height: 36,
-    borderRadius: 9999,
-    backgroundColor: Colors.goldLight,
+  weekRange: {
+    fontSize: 12,
+    fontWeight: '500',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+  },
+  weekNavBtn: {
+    width: 40,
+    height: 40,
+    borderRadius: 20,
+    backgroundColor: 'rgba(169,208,182,0.1)',
     alignItems: 'center',
     justifyContent: 'center',
   },
+  weekNavBtnDisabled: { opacity: 0.3 },
+  weekNavArrow: {
+    fontSize: 18,
+    color: Colors.gold,
+    fontWeight: '700',
+  },
+  weekNavArrowDisabled: { color: Colors.dimText },
   summaryCard: {
     borderRadius: Radii.xxl,
     backgroundColor: Colors.darkGreen,
@@ -267,94 +362,53 @@ const styles = StyleSheet.create({
     color: Colors.white,
     fontFamily: 'Manrope_500Medium',
   },
-  summaryStatDivider: {
-    width: 1,
-    height: 32,
-    backgroundColor: Colors.white,
-  },
-  paymentPill: {
-    borderRadius: Radii.md,
-    backgroundColor: Colors.nearBlack,
-    borderWidth: 1,
-    borderColor: Colors.white,
-    paddingHorizontal: 16,
-    paddingVertical: 10,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-  },
-  paymentPillLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 8,
-  },
-  paymentDot: {
-    width: 16,
-    height: 14,
-    borderRadius: 9999,
-    backgroundColor: Colors.success,
-  },
-  paymentPillText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: Colors.white,
-    fontFamily: 'Manrope_500Medium',
-  },
-  paymentArrow: {
-    color: Colors.white,
-    fontSize: 18,
-  },
-  bonusCard: {
-    borderRadius: Radii.xl,
-    backgroundColor: 'rgb(133,91,0)',
-    borderWidth: 1,
-    borderColor: Colors.goldLight,
+  chartCard: {
+    borderRadius: Radii.xxl,
+    backgroundColor: Colors.cardDark,
     padding: 24,
     gap: 16,
   },
-  bonusHeader: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  bonusIconBg: {
-    width: 36,
-    height: 35,
-    borderRadius: Radii.sm,
-    backgroundColor: 'rgb(255,219,165)',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  bonusIcon: {
-    fontSize: 18,
-  },
-  bonusTitle: {
+  chartTitle: {
     fontSize: 18,
     fontWeight: '700',
-    color: 'rgb(255,219,165)',
+    color: Colors.greenLight,
     fontFamily: 'Manrope_500Medium',
   },
-  bonusSlots: {
+  chart: {
     flexDirection: 'row',
-    gap: 12,
+    alignItems: 'flex-end',
+    justifyContent: 'space-between',
+    gap: 6,
   },
-  bonusSlot: {
-    flex: 1,
-    borderRadius: Radii.md,
-    backgroundColor: 'rgba(0,0,0,0.5)',
-    padding: 12,
-    gap: 4,
+  chartColumn: { flex: 1, alignItems: 'center', gap: 4 },
+  chartValue: {
+    fontSize: 9,
+    fontWeight: '700',
+    color: Colors.goldLight,
+    fontFamily: 'Manrope_500Medium',
+    height: 12,
   },
-  bonusSlotLabel: {
-    fontSize: 12,
-    fontWeight: '400',
-    color: 'rgb(255,219,165)',
+  chartBarTrack: {
+    height: CHART_HEIGHT,
+    justifyContent: 'flex-end',
+    width: '100%',
+    alignItems: 'center',
+  },
+  chartBar: {
+    width: '70%',
+    borderTopLeftRadius: 6,
+    borderTopRightRadius: 6,
+  },
+  chartDay: {
+    fontSize: 11,
+    fontWeight: '600',
+    color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
   },
-  bonusSlotValue: {
-    fontSize: 16,
-    fontWeight: '800',
-    color: 'rgb(255,219,165)',
+  chartDate: {
+    fontSize: 10,
+    fontWeight: '400',
+    color: Colors.dimText,
     fontFamily: 'Manrope_500Medium',
   },
   dailyTable: {
@@ -376,6 +430,11 @@ const styles = StyleSheet.create({
     textAlign: 'center',
     paddingVertical: 16,
   },
+  tableNote: {
+    fontSize: 11,
+    color: Colors.dimText,
+    fontFamily: 'Manrope_500Medium',
+  },
   dayRows: {
     gap: 8,
   },
@@ -394,11 +453,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     color: Colors.greenLight,
-    fontFamily: 'Manrope_500Medium',
-  },
-  dayDist: {
-    fontSize: 12,
-    color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
   },
   dayRowRight: {
@@ -421,22 +475,6 @@ const styles = StyleSheet.create({
     fontSize: 16,
     fontWeight: '700',
     color: Colors.goldLight,
-    fontFamily: 'Manrope_500Medium',
-  },
-  seeAllBtn: {
-    borderWidth: 1,
-    borderColor: 'rgb(139,146,140)',
-    borderRadius: Radii.sm,
-    paddingVertical: 14,
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'center',
-    gap: 8,
-  },
-  seeAllText: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: Colors.greenMid,
     fontFamily: 'Manrope_500Medium',
   },
 });

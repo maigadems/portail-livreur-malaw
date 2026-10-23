@@ -44,7 +44,12 @@ export default function CreerPinScreen() {
         vehiclePlate: params.vehiclePlate,
         avatarUrl: params.avatarUrl,
       });
-      navigation.reset({ index: 0, routes: [{ name: 'DashboardEnLigne' }] });
+      // Le compte existe, mais il ne peut RIEN faire tant que son dossier
+      // n'est pas validé : le serveur refuse la mise en ligne et l'acceptation
+      // de course (403), et la liste des courses lui revient vide. L'envoyer
+      // au tableau de bord reviendrait à le laisser devant une app qui dit
+      // non sans expliquer pourquoi — on l'amène au dépôt des pièces.
+      navigation.reset({ index: 0, routes: [{ name: 'Documents' }] });
     } catch (e: any) {
       // Compte livreur déjà existant (409) : on propose d'aller se connecter
       // plutôt que de laisser réessayer une inscription qui échouera toujours.

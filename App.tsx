@@ -22,6 +22,7 @@ import {
 import Navigation from './src/navigation';
 import SessionExpiredModal from './src/components/SessionExpiredModal';
 import AppAlertHost from './src/components/AppAlert';
+import { CourseProvider } from './src/context/CourseContext';
 
 SplashScreen.preventAutoHideAsync();
 
@@ -48,14 +49,19 @@ export default function App() {
 
   return (
     <SafeAreaProvider>
-      <View style={{ flex: 1 }} onLayout={onLayout}>
-        <StatusBar style="light" />
-        <Navigation />
-        <SessionExpiredModal />
-        {/* Hôte des boîtes de dialogue : monté après le navigateur pour
-            s'afficher au-dessus de n'importe quel écran. */}
-        <AppAlertHost />
-      </View>
+      {/* L'état de service (courses en cours, disponibilité, suivi GPS)
+          enveloppe la navigation : il doit survivre aux changements
+          d'écran, et c'est lui qui pilote le suivi de position. */}
+      <CourseProvider>
+        <View style={{ flex: 1 }} onLayout={onLayout}>
+          <StatusBar style="light" />
+          <Navigation />
+          <SessionExpiredModal />
+          {/* Hôte des boîtes de dialogue : monté après le navigateur pour
+              s'afficher au-dessus de n'importe quel écran. */}
+          <AppAlertHost />
+        </View>
+      </CourseProvider>
     </SafeAreaProvider>
   );
 }

@@ -28,6 +28,7 @@ import PauseScreen from '../screens/PauseScreen';
 // Course flow
 import AlerteCourseScreen from '../screens/AlerteCourseScreen';
 import CoursesDisponiblesScreen from '../screens/CoursesDisponiblesScreen';
+import MesCoursesScreen from '../screens/MesCoursesScreen';
 import EnRoutePickupScreen from '../screens/EnRoutePickupScreen';
 import PickupConfirmeScreen from '../screens/PickupConfirmeScreen';
 import ProblemePickupScreen from '../screens/ProblemePickupScreen';
@@ -100,20 +101,26 @@ export type RootStackParamList = {
   AlerteCourse: { deliveryId: string; orderId: string; earnings: number; distanceKm?: number } | undefined;
   EnRoutePickup: { deliveryId: string; orderId: string };
   PickupConfirme: { deliveryId: string; orderId: string };
-  ProblemePickup: undefined;
+  // Les écrans d'incident portent désormais la course concernée : sans elle
+  // ils ne pouvaient ni afficher le bon contexte, ni ouvrir un litige, ni
+  // libérer la course — le livreur restait bloqué avec une course fantôme.
+  ProblemePickup: { deliveryId: string; orderId: string };
   EnRouteClient: { deliveryId: string; orderId: string };
   AttenteClient: { deliveryId: string; orderId: string };
-  CodeConfirmationLivraison: { orderId: string };
-  ClientIntrouvable: undefined;
-  ConfirmationLivraison: undefined;
+  CodeConfirmationLivraison: { deliveryId?: string; orderId: string };
+  ClientIntrouvable: { deliveryId: string; orderId: string };
+  ConfirmationLivraison: { deliveryId: string; orderId: string };
+  /** Liste des courses en cours, quand le livreur en porte plusieurs. */
+  MesCourses: undefined;
   // Modals
-  ModalAnnulationCourse: undefined;
+  ModalAnnulationCourse: { deliveryId: string; orderId: string };
   ModalDeconnexion: undefined;
   // Wallet
   Wallet: undefined;
   Retrait: undefined;
   Transactions: undefined;
-  RecuCourse: undefined;
+  /** Reçu d'une course terminée — exige la course à afficher. */
+  RecuCourse: { deliveryId: string };
   DetailsHebdos: undefined;
   // Profil
   Profil: undefined;
@@ -175,6 +182,7 @@ export default function Navigation() {
         <Stack.Screen name="DashboardEnLigne" component={DashboardEnLigneScreen} options={fadeTransition as any} />
         <Stack.Screen name="DashboardHorsLigne" component={DashboardHorsLigneScreen} options={fadeTransition as any} />
         <Stack.Screen name="CoursesDisponibles" component={CoursesDisponiblesScreen} />
+        <Stack.Screen name="MesCourses" component={MesCoursesScreen} options={fadeTransition as any} />
         <Stack.Screen name="Pause" component={PauseScreen} />
 
         {/* Course flow */}

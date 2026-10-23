@@ -1,16 +1,23 @@
-import React, { useCallback, useState } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView, ActivityIndicator, RefreshControl,
+  AppState, AppStateStatus,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
 import { me } from '../api/auth';
-import { listAvailableDeliveries, assignDelivery, AvailableDelivery } from '../api/deliveries';
+import { listAvailableDeliveries, assignDelivery, AvailableDelivery, MAX_ACTIVE_DELIVERIES } from '../api/deliveries';
 import { getIgnoredIds } from '../api/ignoredDeliveries';
+import { subscribeCourierFeed } from '../api/realtime';
+import { ApiError } from '../api/client';
+import { useCourse } from '../context/CourseContext';
 import { Alert } from '../components/AppAlert';
 
 const fmt = (n: number) => n.toLocaleString('fr-FR');
+
+/** Cadence du repli par sondage, tant que le canal temps réel n'est pas confirmé. */
+const POLL_MS = 30_000;
 
 /**
  * Toutes les courses disponibles (GET /deliveries/available), pas seulement
@@ -19,11 +26,14 @@ const fmt = (n: number) => n.toLocaleString('fr-FR');
  */
 export default function CoursesDisponiblesScreen() {
   const navigation = useNavigation<any>();
+  const { atCapacity, refresh: refreshService, selectCourse } = useCourse();
   const [deliveries, setDeliveries] = useState<AvailableDelivery[]>([]);
   const [courierId, setCourierId] = useState('');
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
   const [acceptingId, setAcceptingId] = useState<string | null>(null);
+  // Canal temps réel confirmé par le serveur ? Tant que non, on sonde.
+  const [live, setLive] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -49,19 +59,60 @@ export default function CoursesDisponiblesScreen() {
     }
   }, []);
 
-  useFocusEffect(useCallback(() => { load(); }, [load]));
+  useFocusEffect(useCallback(() => { void load(); }, [load]));
 
-  const onRefresh = () => { setRefreshing(true); load(); };
+  /**
+   * Canal temps réel : une course qui apparaît ou disparaît doit se refléter
+   * ici sans que le livreur ait à tirer la liste vers le bas. On recharge
+   * depuis l'API plutôt que de patcher la liste avec la charge utile de
+   * l'événement : le serveur reste la seule source de vérité.
+   */
+  useEffect(() => {
+    const unsubscribe = subscribeCourierFeed({
+      onDeliveryAvailable: () => { void load(); },
+      onDeliveryTaken: () => { void load(); },
+      onStatusChange: setLive,
+    });
+    return unsubscribe;
+  }, [load]);
+
+  // Repli par sondage : le socket meurt en arrière-plan et certains réseaux
+  // le bloquent. Dès que le canal est confirmé, on cesse de doubler les
+  // requêtes.
+  useEffect(() => {
+    if (live) return;
+    const timer = setInterval(() => { void load(); }, POLL_MS);
+    return () => clearInterval(timer);
+  }, [live, load]);
+
+  // Retour au premier plan : la liste peut avoir plusieurs minutes de retard.
+  useEffect(() => {
+    const onChange = (state: AppStateStatus) => {
+      if (state === 'active') void load();
+    };
+    const sub = AppState.addEventListener('change', onChange);
+    return () => sub.remove();
+  }, [load]);
+
+  const onRefresh = () => { setRefreshing(true); void load(); };
 
   const accept = async (d: AvailableDelivery) => {
-    if (!courierId || acceptingId) return;
+    if (!courierId || acceptingId || atCapacity) return;
     setAcceptingId(d.id);
     try {
       await assignDelivery(d.id, courierId);
+      selectCourse(d.id);
+      await refreshService();
       navigation.navigate('EnRoutePickup', { deliveryId: d.id, orderId: d.order.id });
     } catch (e: any) {
-      Alert.alert('Course indisponible', e?.message ?? "Cette course n'est plus disponible.");
-      load();
+      // 409 : un autre livreur a été plus rapide. Dans tous les cas on
+      // recharge, pour ne pas laisser une carte obsolète à l'écran.
+      const taken = e instanceof ApiError && e.status === 409;
+      Alert.alert(
+        taken ? 'Course prise' : 'Course indisponible',
+        e?.message ?? "Cette course n'est plus disponible.",
+      );
+      void load();
     } finally {
       setAcceptingId(null);
     }
@@ -87,6 +138,23 @@ export default function CoursesDisponiblesScreen() {
           refreshControl={<RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.goldLight} />}
         >
           <Text style={styles.count}>{deliveries.length} course{deliveries.length > 1 ? 's' : ''} à proximité</Text>
+
+          {/* État du canal, sans emphase : une liste figée sans avertissement
+              fait croire qu'il n'y a plus de courses. */}
+          <View style={styles.feedRow}>
+            <View style={[styles.feedDot, !live && styles.feedDotOff]} />
+            <Text style={styles.feedText}>
+              {live ? 'Temps réel' : 'Actualisation toutes les 30 s'}
+            </Text>
+          </View>
+
+          {atCapacity ? (
+            <View style={styles.capacityCard}>
+              <Text style={styles.capacityText}>
+                Vous gérez déjà {MAX_ACTIVE_DELIVERIES} courses. Terminez-en une pour en accepter d'autres.
+              </Text>
+            </View>
+          ) : null}
 
           {deliveries.length === 0 ? (
             <View style={styles.empty}>
@@ -127,7 +195,7 @@ export default function CoursesDisponiblesScreen() {
                 <TouchableOpacity
                   style={[styles.acceptBtn, acceptingId === d.id && { opacity: 0.7 }]}
                   onPress={() => accept(d)}
-                  disabled={acceptingId != null}
+                  disabled={acceptingId != null || atCapacity}
                 >
                   {acceptingId === d.id ? (
                     <ActivityIndicator color="rgb(19,55,37)" />
@@ -169,6 +237,41 @@ const styles = StyleSheet.create({
     color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
     letterSpacing: 0.5,
+  },
+  feedRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 6,
+    marginTop: -6,
+  },
+  feedDot: {
+    width: 7,
+    height: 7,
+    borderRadius: 4,
+    backgroundColor: Colors.success,
+  },
+  feedDotOff: {
+    backgroundColor: Colors.dimText,
+  },
+  feedText: {
+    fontSize: 11,
+    color: Colors.dimText,
+    fontFamily: 'Manrope_500Medium',
+    letterSpacing: 0.3,
+  },
+  capacityCard: {
+    backgroundColor: Colors.cardDark,
+    borderRadius: Radii.md,
+    borderWidth: 1,
+    borderColor: 'rgba(169,208,182,0.2)',
+    padding: 16,
+  },
+  capacityText: {
+    fontSize: 14,
+    color: Colors.greenMid,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    lineHeight: 20,
   },
   empty: { paddingVertical: 60, alignItems: 'center' },
   emptyText: {

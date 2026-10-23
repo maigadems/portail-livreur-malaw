@@ -1,78 +1,187 @@
-import React, { useState } from 'react';
+import React, { useCallback, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity, ScrollView,
-  Dimensions,
+  ActivityIndicator, RefreshControl,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useFocusEffect, useNavigation } from '@react-navigation/native';
+
 import { Colors, Radii } from '../constants/theme';
 import BottomNavBar from '../components/BottomNavBar';
 import LivreurAvatar from '../components/LivreurAvatar';
+import { Alert } from '../components/AppAlert';
+import {
+  listNotifications, markRead, markAllRead, removeNotification,
+  filterNotifications, AppNotification, NotificationFilter,
+} from '../api/notifications';
 
-type FilterType = 'Toutes' | 'Courses' | 'Paiements' | 'Infos';
-
-const notifications = [
-  {
-    type: 'payment',
-    icon: '🏍️',
-    iconBg: Colors.darkGreen,
-    iconColor: Colors.greenMid,
-    title: 'Paiement reçu',
-    timeLabel: "AUJOURD'HUI",
-    amount: '47,300 FCFA',
-    message: 'Le montant a été crédité sur votre portefeuille Malaw.',
-    unread: true,
-    borderColor: Colors.greenMid,
-  },
-  {
-    type: 'delivery',
-    icon: '✓',
-    iconBg: Colors.darkGreen,
-    iconColor: Colors.greenMid,
-    title: 'Course terminée',
-    timeLabel: 'IL Y A 3H',
-    amount: null,
-    message: 'Livraison réussie à Point E. Votre client a validé la réception.',
-    unread: false,
-    borderColor: 'transparent',
-  },
-  {
-    type: 'review',
-    icon: '⭐',
-    iconBg: Colors.goldLight,
-    iconColor: Colors.goldLight,
-    title: 'Nouvel avis reçu',
-    timeLabel: 'HIER',
-    amount: null,
-    message: '"Excellent service, très poli et rapide. Merci !"',
-    unread: false,
-    borderColor: 'transparent',
-    stars: 5,
-  },
-  {
-    type: 'document',
-    icon: '📄',
-    iconBg: 'rgb(57,55,45)',
-    iconColor: 'rgb(203,198,185)',
-    title: 'Rappel : Documents',
-    timeLabel: 'HIER',
-    amount: null,
-    message: 'Votre assurance moto expire dans 5 jours. Veuillez mettre à jour vos documents.',
-    unread: false,
-    borderColor: 'transparent',
-    action: 'Mettre à jour maintenant',
-  },
+const FILTERS: { key: NotificationFilter; label: string }[] = [
+  { key: 'all', label: 'Toutes' },
+  { key: 'courses', label: 'Courses' },
+  { key: 'paiements', label: 'Paiements' },
+  { key: 'infos', label: 'Infos' },
 ];
+
+/**
+ * Le serveur émet des types précis (`courier_delivery_available`,
+ * `payout_paid`, `courier_kyc_rejected`…) tandis que `filterNotifications`
+ * raisonne par familles. On traduit ici, sans quoi les pastilles de filtre ne
+ * retiendraient jamais rien. Tout type inconnu tombe dans « Infos » plutôt que
+ * de disparaître de l'écran.
+ */
+function canonicalType(type: string): string {
+  const t = (type ?? '').toLowerCase();
+  if (t.startsWith('order_')) return 'order_status';
+  if (t.includes('delivery_available')) return 'delivery_available';
+  if (t.includes('delivery_cancelled')) return 'delivery_cancelled';
+  if (t.includes('kyc')) return 'kyc_decision';
+  if (t.startsWith('payout')) return 'payout_processed';
+  if (t.includes('dispute')) return 'dispute_resolved';
+  if (t.includes('review')) return 'review_received';
+  if (t.includes('promo')) return 'promo';
+  return 'system';
+}
+
+const ICONS: Record<string, { icon: string; bg: string }> = {
+  order_status: { icon: '📦', bg: Colors.darkGreen },
+  delivery_available: { icon: '🏍️', bg: Colors.darkGreen },
+  delivery_cancelled: { icon: '✕', bg: 'rgba(192,57,43,0.25)' },
+  kyc_decision: { icon: '📄', bg: 'rgb(57,55,45)' },
+  dispute_resolved: { icon: '🛠️', bg: 'rgb(57,55,45)' },
+  payout_processed: { icon: '💰', bg: Colors.darkGreen },
+  review_received: { icon: '⭐', bg: Colors.goldLight },
+  promo: { icon: '🎁', bg: Colors.goldLight },
+  system: { icon: 'ℹ️', bg: 'rgb(57,55,45)' },
+};
+
+/** Écran à ouvrir au tap, déduit du type et de la charge `data` du serveur. */
+function routeFor(n: AppNotification): { screen: string; params?: object } | null {
+  const data = (n.data ?? {}) as Record<string, unknown>;
+  const orderId = typeof data.orderId === 'string' ? data.orderId : undefined;
+
+  switch (canonicalType(n.type)) {
+    case 'delivery_available':
+      // La course peut avoir été prise entre-temps : on renvoie vers la liste
+      // des courses réellement disponibles, jamais vers une alerte périmée.
+      return { screen: 'CoursesDisponibles' };
+    case 'delivery_cancelled':
+      return { screen: 'MesCourses' };
+    case 'payout_processed':
+      return { screen: 'Wallet' };
+    case 'kyc_decision':
+      return { screen: 'StatutDocuments' };
+    case 'review_received':
+      return { screen: 'Evaluations' };
+    case 'dispute_resolved':
+      return orderId ? { screen: 'Historique' } : null;
+    default:
+      return null;
+  }
+}
+
+/** Ancienneté lisible, sans dépendance à une librairie de dates. */
+function timeLabel(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return '';
+  const minutes = Math.floor((Date.now() - d.getTime()) / 60000);
+  if (minutes < 1) return "À L'INSTANT";
+  if (minutes < 60) return `IL Y A ${minutes} MIN`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 24) return `IL Y A ${hours}H`;
+  if (hours < 48) return 'HIER';
+  return d.toLocaleDateString('fr-FR', { day: 'numeric', month: 'short' }).toUpperCase();
+}
 
 export default function NotificationsScreen() {
   const navigation = useNavigation<any>();
-  const [activeFilter, setActiveFilter] = useState<FilterType>('Toutes');
-  const [allRead, setAllRead] = useState(false);
-  const filters: FilterType[] = ['Toutes', 'Courses', 'Paiements', 'Infos'];
+  const [items, setItems] = useState<AppNotification[]>([]);
+  const [activeFilter, setActiveFilter] = useState<NotificationFilter>('all');
+  const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+  const [markingAll, setMarkingAll] = useState(false);
+
+  // Rechargé à chaque affichage : une notification lue ailleurs (push ouvert,
+  // autre écran) ne doit pas rester en gras ici.
+  useFocusEffect(
+    useCallback(() => {
+      let active = true;
+      listNotifications(50)
+        .then((list) => { if (active) setItems(list); })
+        .catch((e: any) => {
+          if (active) Alert.alert('Notifications indisponibles', e?.message ?? 'Réessayez plus tard.');
+        })
+        .finally(() => { if (active) setLoading(false); });
+      return () => { active = false; };
+    }, []),
+  );
+
+  const onRefresh = async () => {
+    if (refreshing) return;
+    setRefreshing(true);
+    try {
+      setItems(await listNotifications(50));
+    } catch (e: any) {
+      Alert.alert('Actualisation impossible', e?.message ?? 'Réessayez plus tard.');
+    } finally {
+      setRefreshing(false);
+    }
+  };
+
+  const unread = items.filter((n) => !n.readAt).length;
+
+  const onMarkAll = async () => {
+    if (markingAll || unread === 0) return;
+    const previous = items;
+    const now = new Date().toISOString();
+    setItems(items.map((n) => (n.readAt ? n : { ...n, readAt: now })));
+    setMarkingAll(true);
+    try {
+      await markAllRead();
+    } catch (e: any) {
+      setItems(previous);
+      Alert.alert('Action impossible', e?.message ?? 'Réessayez dans un instant.');
+    } finally {
+      setMarkingAll(false);
+    }
+  };
+
+  const onOpen = async (n: AppNotification) => {
+    if (!n.readAt) {
+      const now = new Date().toISOString();
+      setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: now } : x)));
+      // Le marquage ne doit jamais retarder l'ouverture de l'écran visé :
+      // s'il échoue, la notification réapparaîtra non lue au prochain chargement.
+      markRead(n.id).catch(() => {
+        setItems((prev) => prev.map((x) => (x.id === n.id ? { ...x, readAt: null } : x)));
+      });
+    }
+    const route = routeFor(n);
+    if (route) navigation.navigate(route.screen, route.params);
+  };
+
+  const onDelete = async (n: AppNotification) => {
+    const previous = items;
+    setItems((prev) => prev.filter((x) => x.id !== n.id));
+    try {
+      await removeNotification(n.id);
+    } catch (e: any) {
+      setItems(previous);
+      Alert.alert('Suppression impossible', e?.message ?? 'Réessayez dans un instant.');
+    }
+  };
+
+  // `filterNotifications` travaille sur les familles : on lui passe une copie
+  // normalisée, puis on retient les notifications d'origine correspondantes.
+  const keptIds = new Set(
+    filterNotifications(
+      items.map((n) => ({ ...n, type: canonicalType(n.type) })),
+      activeFilter,
+    ).map((n) => n.id),
+  );
+  const visible = items.filter((n) => keptIds.has(n.id));
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* TopAppBar */}
       <View style={styles.topBar}>
         <LivreurAvatar size={40} />
       </View>
@@ -81,130 +190,135 @@ export default function NotificationsScreen() {
         style={styles.scrollArea}
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.goldLight} />
+        }
       >
-        {/* Header */}
         <View style={styles.header}>
           <Text style={styles.pageTitle}>Notifications</Text>
-          <TouchableOpacity onPress={() => setAllRead(true)}>
-            <Text style={[styles.markAllRead, allRead && { opacity: 0.4 }]}>
-              {allRead ? 'Tout lu ✓' : 'Tout marquer comme\nlu'}
-            </Text>
+          <TouchableOpacity onPress={onMarkAll} disabled={unread === 0 || markingAll}>
+            {markingAll ? (
+              <ActivityIndicator color={Colors.goldLight} size="small" />
+            ) : (
+              <Text style={[styles.markAllRead, unread === 0 && { opacity: 0.4 }]}>
+                {unread === 0 ? 'Tout lu ✓' : 'Tout marquer comme\nlu'}
+              </Text>
+            )}
           </TouchableOpacity>
         </View>
 
-        {/* Filter pills */}
+        {/* Filtres */}
         <ScrollView horizontal showsHorizontalScrollIndicator={false}>
           <View style={styles.filterPills}>
-            {filters.map((f) => (
+            {FILTERS.map((f) => (
               <TouchableOpacity
-                key={f}
+                key={f.key}
                 style={[
                   styles.filterPill,
-                  activeFilter === f ? styles.filterPillActive : styles.filterPillInactive,
+                  activeFilter === f.key ? styles.filterPillActive : styles.filterPillInactive,
                 ]}
-                onPress={() => setActiveFilter(f)}
+                onPress={() => setActiveFilter(f.key)}
               >
                 <Text
                   style={[
                     styles.filterPillText,
-                    activeFilter === f ? styles.filterPillTextActive : styles.filterPillTextInactive,
+                    activeFilter === f.key ? styles.filterPillTextActive : styles.filterPillTextInactive,
                   ]}
                 >
-                  {f}
+                  {f.label}
                 </Text>
               </TouchableOpacity>
             ))}
           </View>
         </ScrollView>
 
-        {/* Notifications list */}
-        <View style={styles.notifList}>
-          {notifications.map((notif, i) => (
-            <TouchableOpacity
-              key={i}
-              style={[
-                styles.notifCard,
-                notif.unread && !allRead ? styles.notifCardUnread : styles.notifCardRead,
-                notif.unread && !allRead && { borderColor: Colors.greenMid },
-              ]}
-              onPress={() => {
-                if (notif.type === 'payment') navigation.navigate('Wallet');
-                else if (notif.type === 'delivery') navigation.navigate('RecuCourse');
-                else if (notif.type === 'review') navigation.navigate('Evaluations');
-                else if (notif.type === 'document') navigation.navigate('StatutDocuments');
-              }}
-              activeOpacity={0.8}
-            >
-              {/* Unread indicator */}
-              {notif.unread && <View style={styles.unreadIndicator} />}
-
-              {/* Icon */}
-              <View style={[styles.notifIcon, { backgroundColor: notif.iconBg }]}>
-                <Text style={{ fontSize: 18 }}>{notif.icon}</Text>
-              </View>
-
-              {/* Content */}
-              <View style={styles.notifContent}>
-                <View style={styles.notifHeader}>
-                  <Text
-                    style={[
-                      styles.notifTitle,
-                      { color: notif.unread ? Colors.nearBlack : Colors.greenLight },
-                    ]}
-                  >
-                    {notif.title}
-                  </Text>
-                  <Text
-                    style={[
-                      styles.notifTime,
-                      { color: notif.unread ? Colors.nearBlack : Colors.muted },
-                    ]}
-                  >
-                    {notif.timeLabel}
-                  </Text>
-                </View>
-
-                {notif.amount && (
-                  <Text
-                    style={[
-                      styles.notifAmount,
-                      { color: notif.unread ? Colors.darkGreen : Colors.greenLight },
-                    ]}
-                  >
-                    {notif.amount}
-                  </Text>
-                )}
-
-                {notif.stars && (
-                  <View style={styles.starsRow}>
-                    {[...Array(notif.stars)].map((_, s) => (
-                      <Text key={s} style={styles.star}>⭐</Text>
-                    ))}
-                  </View>
-                )}
-
-                <Text
+        {loading ? (
+          <ActivityIndicator color={Colors.gold} style={{ marginTop: 40 }} />
+        ) : visible.length === 0 ? (
+          <View style={styles.emptyCard}>
+            <Text style={styles.emptyIcon}>🔔</Text>
+            <Text style={styles.emptyTitle}>
+              {items.length === 0 ? 'Aucune notification' : 'Rien dans cette catégorie'}
+            </Text>
+            <Text style={styles.emptyDesc}>
+              {items.length === 0
+                ? 'Vos alertes de courses, paiements et documents apparaîtront ici.'
+                : 'Changez de filtre pour voir vos autres notifications.'}
+            </Text>
+          </View>
+        ) : (
+          <View style={styles.notifList}>
+            {visible.map((n) => {
+              const unreadItem = !n.readAt;
+              const visuals = ICONS[canonicalType(n.type)] ?? ICONS.system;
+              return (
+                <TouchableOpacity
+                  key={n.id}
                   style={[
-                    styles.notifMessage,
-                    { color: notif.unread ? Colors.nearBlack : Colors.muted },
+                    styles.notifCard,
+                    unreadItem ? styles.notifCardUnread : styles.notifCardRead,
+                    unreadItem && { borderColor: Colors.greenMid },
                   ]}
+                  onPress={() => onOpen(n)}
+                  activeOpacity={0.8}
                 >
-                  {notif.message}
-                </Text>
+                  <View style={[styles.notifIcon, { backgroundColor: visuals.bg }]}>
+                    <Text style={{ fontSize: 18 }}>{visuals.icon}</Text>
+                  </View>
 
-                {notif.action && (
-                  <TouchableOpacity
-                    style={styles.notifAction}
-                    onPress={() => navigation.navigate('Documents')}
-                  >
-                    <Text style={styles.notifActionText}>{notif.action}</Text>
-                    <Text style={{ color: Colors.goldLight, fontSize: 12 }}>→</Text>
-                  </TouchableOpacity>
-                )}
-              </View>
-            </TouchableOpacity>
-          ))}
-        </View>
+                  <View style={styles.notifContent}>
+                    <View style={styles.notifHeader}>
+                      <View style={styles.titleRow}>
+                        {unreadItem && <View style={styles.unreadDot} />}
+                        <Text
+                          style={[
+                            styles.notifTitle,
+                            { color: unreadItem ? Colors.nearBlack : Colors.greenLight },
+                          ]}
+                          numberOfLines={2}
+                        >
+                          {n.title}
+                        </Text>
+                      </View>
+                      <Text
+                        style={[
+                          styles.notifTime,
+                          { color: unreadItem ? Colors.nearBlack : Colors.muted },
+                        ]}
+                      >
+                        {timeLabel(n.createdAt)}
+                      </Text>
+                    </View>
+
+                    <Text
+                      style={[
+                        styles.notifMessage,
+                        { color: unreadItem ? Colors.nearBlack : Colors.muted },
+                      ]}
+                    >
+                      {n.body}
+                    </Text>
+
+                    <TouchableOpacity
+                      style={styles.deleteBtn}
+                      onPress={() => onDelete(n)}
+                      hitSlop={{ top: 8, bottom: 8, left: 8, right: 8 }}
+                    >
+                      <Text
+                        style={[
+                          styles.deleteBtnText,
+                          { color: unreadItem ? 'rgba(0,18,7,0.6)' : Colors.dimText },
+                        ]}
+                      >
+                        Supprimer
+                      </Text>
+                    </TouchableOpacity>
+                  </View>
+                </TouchableOpacity>
+              );
+            })}
+          </View>
+        )}
       </ScrollView>
 
       <BottomNavBar active="livraisons" homeScreen="DashboardEnLigne" />
@@ -224,46 +338,6 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
     paddingHorizontal: 24,
-  },
-  backBtn: {
-    width: 34,
-    height: 28,
-    justifyContent: 'center',
-  },
-  backArrow: {
-    fontSize: 22,
-    color: Colors.cream,
-    fontWeight: '600',
-  },
-  hamburger: {
-    gap: 3,
-  },
-  hamburgerLine: {
-    width: 18,
-    height: 2,
-    backgroundColor: Colors.cream,
-    borderRadius: 1,
-  },
-  logoPlaceholder: {
-    width: 66,
-    height: 60,
-    backgroundColor: 'rgba(217,217,217,0.2)',
-    borderRadius: 4,
-  },
-  avatarBorder: {
-    width: 40,
-    height: 40,
-    borderRadius: 20,
-    borderWidth: 2,
-    borderColor: Colors.gold,
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  avatarInner: {
-    width: 32,
-    height: 32,
-    borderRadius: 16,
-    backgroundColor: Colors.darkGreenTint,
   },
   scrollArea: { flex: 1 },
   scrollContent: {
@@ -328,7 +402,6 @@ const styles = StyleSheet.create({
     padding: 20,
     flexDirection: 'row',
     gap: 16,
-    position: 'relative',
     overflow: 'hidden',
   },
   notifCardUnread: {
@@ -337,15 +410,6 @@ const styles = StyleSheet.create({
   },
   notifCardRead: {
     backgroundColor: Colors.cardDark,
-  },
-  unreadIndicator: {
-    position: 'absolute',
-    top: 20,
-    right: 20,
-    width: 8,
-    height: 8,
-    borderRadius: 4,
-    backgroundColor: Colors.successDark,
   },
   notifIcon: {
     width: 46,
@@ -362,28 +426,30 @@ const styles = StyleSheet.create({
     flexDirection: 'row',
     justifyContent: 'space-between',
     alignItems: 'center',
+    gap: 8,
+  },
+  titleRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 8,
+    flex: 1,
+  },
+  unreadDot: {
+    width: 8,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: Colors.successDark,
   },
   notifTitle: {
-    fontSize: 18,
+    flex: 1,
+    fontSize: 17,
     fontWeight: '700',
     fontFamily: 'Manrope_500Medium',
   },
   notifTime: {
-    fontSize: 12,
+    fontSize: 11,
     fontWeight: '500',
     fontFamily: 'Manrope_500Medium',
-  },
-  notifAmount: {
-    fontSize: 20,
-    fontWeight: '800',
-    fontFamily: 'Manrope_500Medium',
-  },
-  starsRow: {
-    flexDirection: 'row',
-    gap: 2,
-  },
-  star: {
-    fontSize: 11,
   },
   notifMessage: {
     fontSize: 14,
@@ -391,16 +457,40 @@ const styles = StyleSheet.create({
     fontFamily: 'Manrope_500Medium',
     lineHeight: 20,
   },
-  notifAction: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 4,
-    marginTop: 4,
+  deleteBtn: {
+    alignSelf: 'flex-start',
+    paddingVertical: 4,
   },
-  notifActionText: {
-    fontSize: 14,
+  deleteBtnText: {
+    fontSize: 12,
     fontWeight: '700',
-    color: Colors.goldLight,
     fontFamily: 'Manrope_500Medium',
+    textDecorationLine: 'underline',
+  },
+  emptyCard: {
+    borderRadius: Radii.md,
+    backgroundColor: Colors.cardDark,
+    borderWidth: 1,
+    borderColor: 'rgba(65,72,67,0.4)',
+    padding: 32,
+    alignItems: 'center',
+    gap: 10,
+    marginTop: 16,
+  },
+  emptyIcon: { fontSize: 40 },
+  emptyTitle: {
+    fontSize: 17,
+    fontWeight: '800',
+    color: Colors.greenLight,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+  },
+  emptyDesc: {
+    fontSize: 14,
+    fontWeight: '500',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    lineHeight: 22,
   },
 });

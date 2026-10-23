@@ -6,12 +6,13 @@ import { api, apiPublic, saveSession, clearSession, getStoredUser } from './clie
  * - Inscription : téléphone → OTP (POST /auth/send-otp), puis nom + PIN +
  *   véhicule → POST /auth/register-courier (crée un compte role=COURIER).
  *
- * ⚠️ L'envoi de SMS réel n'est pas actif (SMS_PROVIDER=stub) : send-otp
- * renvoie devOtp dans la réponse (OTP_DEV_RETURN_IN_RESPONSE=true), affiché
- * à l'écran. Le KYC/documents n'est pas modélisé — le livreur est actif
- * immédiatement après inscription.
+ * L'envoi de SMS réel n'est pas actif (SMS_PROVIDER=stub, choix volontaire) :
+ * send-otp renvoie devOtp dans la réponse, affiché à l'écran.
  *
- * Compte de test seedé : +221770000003 / PIN 1234 (voir prisma/seed.ts).
+ * Après register-courier, le compte existe mais le dossier KYC est BLOQUANT :
+ * l'inscription enchaîne sur le dépôt des pièces (voir documents.ts), et le
+ * serveur refuse le passage en ligne et l'acceptation de course tant que le
+ * dossier n'est pas APPROVED.
  */
 
 export type CourierUser = {

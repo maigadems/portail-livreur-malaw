@@ -1,19 +1,61 @@
-import React, { useState, useEffect } from 'react';
+import React, { useCallback, useEffect, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, Dimensions,
+  View, Text, StyleSheet, TouchableOpacity, Linking, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
-import { useNavigation } from '@react-navigation/native';
+import { useNavigation, useRoute } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
+import { Alert } from '../components/AppAlert';
+import { getOrder } from '../api/orders';
+import { ABANDON_REASONS, abandonDelivery } from '../api/deliveries';
+import { createDispute } from '../api/disputes';
+import { uploadImage } from '../api/uploads';
+import { captureDocument } from '../utils/pickDocument';
+import { useCourse } from '../context/CourseContext';
 
-const { width } = Dimensions.get('window');
 const WAIT_SECONDS = 300; // 5 min
+const MAX_CALLS = 3;
+const DETAILS_MAX = 500;
+
+type OrderLite = {
+  customer?: { name: string | null; phone: string } | null;
+  deliveryAddress?: { line: string } | null;
+};
+
+/** Le motif est déclaré non retenu côté serveur : on le dit au livreur. */
+const REASON = ABANDON_REASONS.find((r) => r.value === 'CUSTOMER_UNREACHABLE')!;
 
 export default function ClientIntrouvableScreen() {
   const navigation = useNavigation<any>();
+  const route = useRoute<any>();
+  const { deliveryId, orderId } = route.params ?? {};
+  const { refresh } = useCourse();
+
+  const [order, setOrder] = useState<OrderLite | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
   const [elapsed, setElapsed] = useState(0);
   const [callAttempts, setCallAttempts] = useState(0);
-  const [photoTaken, setPhotoTaken] = useState(false);
+  const [photoUrl, setPhotoUrl] = useState<string | null>(null);
+  const [uploading, setUploading] = useState(false);
+  const [releasing, setReleasing] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    if (!orderId) {
+      setLoading(false);
+      setError("Aucune commande n'a été transmise à cet écran.");
+      return;
+    }
+    getOrder(orderId)
+      .then((o: any) => { if (active) setOrder(o); })
+      .catch((e: any) => {
+        if (active) setError(e?.message ?? 'Impossible de charger les informations du client.');
+      })
+      .finally(() => { if (active) setLoading(false); });
+    return () => { active = false; };
+  }, [orderId]);
 
   useEffect(() => {
     const t = setInterval(() => setElapsed(e => e + 1), 1000);
@@ -22,13 +64,100 @@ export default function ClientIntrouvableScreen() {
 
   const waitPct = Math.min((elapsed / WAIT_SECONDS) * 100, 100);
   const remainSec = Math.max(WAIT_SECONDS - elapsed, 0);
-  const canCancel = elapsed >= WAIT_SECONDS || callAttempts >= 3;
+  const canRelease = elapsed >= WAIT_SECONDS || callAttempts >= MAX_CALLS;
 
   const formatTime = (s: number) => {
     const m = Math.floor(s / 60);
     const sec = s % 60;
     return `${m}:${sec.toString().padStart(2, '0')}`;
   };
+
+  const callClient = useCallback(async () => {
+    const phone = order?.customer?.phone;
+    if (!phone) {
+      Alert.alert('Appel impossible', "Le numéro du client n'est pas disponible.");
+      return;
+    }
+    try {
+      await Linking.openURL(`tel:${phone}`);
+      // Le compteur ne progresse qu'après un appel réellement lancé : c'est
+      // lui qui débloque la libération de la course.
+      setCallAttempts(a => Math.min(a + 1, MAX_CALLS));
+    } catch {
+      Alert.alert('Appel impossible', "Impossible d'ouvrir le téléphone depuis l'application.");
+    }
+  }, [order?.customer?.phone]);
+
+  const takePhoto = useCallback(async () => {
+    if (uploading) return;
+    setUploading(true);
+    try {
+      const dataUrl = await captureDocument();
+      if (!dataUrl) return;
+      const { url } = await uploadImage(dataUrl, 'kyc');
+      setPhotoUrl(url);
+    } catch (e: any) {
+      Alert.alert('Photo non enregistrée', e?.message ?? "Le dépôt de la photo a échoué.");
+    } finally {
+      setUploading(false);
+    }
+  }, [uploading]);
+
+  const release = useCallback(async () => {
+    if (releasing || !canRelease) return;
+    if (!deliveryId) {
+      Alert.alert(
+        'Course non identifiée',
+        "Cet écran n'a pas reçu la course à libérer. Revenez à la course puis réessayez.",
+      );
+      return;
+    }
+    setReleasing(true);
+
+    const waited = Math.floor(elapsed / 60);
+    const details = [
+      `Client injoignable à l'adresse : ${order?.deliveryAddress?.line ?? 'adresse non chargée'}.`,
+      `${callAttempts} tentative${callAttempts > 1 ? 's' : ''} d'appel, ${waited} min d'attente sur place.`,
+      photoUrl ? `Photo de preuve : ${photoUrl}` : 'Aucune photo de preuve.',
+    ].join(' ').slice(0, DETAILS_MAX);
+
+    // Le litige d'abord : une fois la course relâchée, le livreur n'y est
+    // plus rattaché et le serveur refuserait le signalement.
+    let disputeError: string | null = null;
+    if (orderId) {
+      try {
+        await createDispute(orderId, {
+          category: 'ORDER_NOT_RECEIVED',
+          subject: `Client injoignable — ${order?.customer?.name ?? 'client'}`.slice(0, 160),
+          description: details,
+        });
+      } catch (e: any) {
+        disputeError = e?.message ?? 'Le signalement au support a échoué.';
+      }
+    }
+
+    try {
+      await abandonDelivery(deliveryId, { reason: 'CUSTOMER_UNREACHABLE', details });
+      await refresh();
+      Alert.alert(
+        'Course libérée',
+        disputeError
+          ? `La course a été rendue au dispatch. En revanche, le signalement au support n'a pas pu être ouvert : ${disputeError}`
+          : "La course a été rendue au dispatch et le support a reçu votre signalement. Ce motif n'est pas retenu contre vous.",
+        [{ text: 'OK', onPress: () => navigation.replace('DashboardEnLigne') }],
+      );
+    } catch (e: any) {
+      Alert.alert(
+        'Course non libérée',
+        e?.message ?? "Le serveur a refusé l'abandon de la course. Réessayez dans un instant.",
+      );
+    } finally {
+      setReleasing(false);
+    }
+  }, [
+    releasing, canRelease, deliveryId, orderId, elapsed, callAttempts,
+    photoUrl, order, refresh, navigation,
+  ]);
 
   return (
     <SafeAreaView style={styles.container}>
@@ -51,10 +180,16 @@ export default function ClientIntrouvableScreen() {
         {/* Status */}
         <View style={styles.statusBlock}>
           <Text style={styles.statusTitle}>En attente du client</Text>
-          <Text style={styles.statusDesc}>
-            Aminata S. · Plateau, Rue 10{'\n'}
-            Tentatives d'appel : {callAttempts}/3
-          </Text>
+          {loading ? (
+            <ActivityIndicator color={Colors.greenMid} />
+          ) : (
+            <Text style={styles.statusDesc}>
+              {order?.customer?.name ?? 'Client'}
+              {order?.deliveryAddress?.line ? ` · ${order.deliveryAddress.line}` : ''}{'\n'}
+              Tentatives d'appel : {callAttempts}/{MAX_CALLS}
+            </Text>
+          )}
+          {error ? <Text style={styles.errorText}>{error}</Text> : null}
         </View>
 
         {/* Wait timer */}
@@ -68,14 +203,13 @@ export default function ClientIntrouvableScreen() {
           <View style={styles.timerTrack}>
             <View style={[styles.timerFill, { width: `${waitPct}%` as any }]} />
           </View>
-          {!canCancel && (
-            <Text style={styles.timerHint}>
-              Annulation possible dans {formatTime(remainSec)}
-            </Text>
-          )}
-          {canCancel && (
+          {canRelease ? (
             <Text style={styles.timerDone}>
-              ✓ Vous pouvez maintenant annuler sans pénalité
+              ✓ Vous pouvez libérer la course maintenant
+            </Text>
+          ) : (
+            <Text style={styles.timerHint}>
+              Libération possible dans {formatTime(remainSec)}, ou après {MAX_CALLS} appels
             </Text>
           )}
         </View>
@@ -86,21 +220,24 @@ export default function ClientIntrouvableScreen() {
 
           <TouchableOpacity
             style={styles.actionItem}
-            onPress={() => setCallAttempts(a => Math.min(a + 1, 3))}
+            onPress={callClient}
+            disabled={loading}
+            activeOpacity={0.8}
           >
             <View style={styles.actionIcon}>
               <Text style={{ fontSize: 22 }}>📞</Text>
             </View>
             <View style={styles.actionText}>
               <Text style={styles.actionLabel}>Appeler le client</Text>
-              <Text style={styles.actionDesc}>{callAttempts}/3 appels</Text>
+              <Text style={styles.actionDesc}>
+                {order?.customer?.phone ?? 'Numéro indisponible'} · {callAttempts}/{MAX_CALLS} appels
+              </Text>
             </View>
-            {callAttempts < 3 && (
+            {callAttempts < MAX_CALLS ? (
               <View style={styles.actionBadge}>
                 <Text style={styles.actionBadgeText}>Appeler</Text>
               </View>
-            )}
-            {callAttempts >= 3 && (
+            ) : (
               <View style={[styles.actionBadge, { backgroundColor: 'rgba(169,208,182,0.2)' }]}>
                 <Text style={[styles.actionBadgeText, { color: Colors.greenMid }]}>✓</Text>
               </View>
@@ -108,17 +245,25 @@ export default function ClientIntrouvableScreen() {
           </TouchableOpacity>
 
           <TouchableOpacity
-            style={[styles.actionItem, photoTaken && styles.actionItemDone]}
-            onPress={() => setPhotoTaken(true)}
+            style={[styles.actionItem, !!photoUrl && styles.actionItemDone]}
+            onPress={takePhoto}
+            disabled={uploading}
+            activeOpacity={0.8}
           >
             <View style={styles.actionIcon}>
               <Text style={{ fontSize: 22 }}>📸</Text>
             </View>
             <View style={styles.actionText}>
               <Text style={styles.actionLabel}>Prendre une photo de preuve</Text>
-              <Text style={styles.actionDesc}>Photo de l'adresse ou de la tentative de livraison</Text>
+              <Text style={styles.actionDesc}>
+                {photoUrl
+                  ? 'Photo transmise au support avec votre signalement'
+                  : "Photo de l'adresse ou de la tentative de livraison"}
+              </Text>
             </View>
-            {!photoTaken ? (
+            {uploading ? (
+              <ActivityIndicator color={Colors.goldLight} />
+            ) : !photoUrl ? (
               <View style={styles.actionBadge}>
                 <Text style={styles.actionBadgeText}>Photo</Text>
               </View>
@@ -132,13 +277,14 @@ export default function ClientIntrouvableScreen() {
           <TouchableOpacity
             style={styles.actionItem}
             onPress={() => navigation.navigate('Aide')}
+            activeOpacity={0.8}
           >
             <View style={styles.actionIcon}>
               <Text style={{ fontSize: 22 }}>💬</Text>
             </View>
             <View style={styles.actionText}>
               <Text style={styles.actionLabel}>Contacter le support</Text>
-              <Text style={styles.actionDesc}>Un agent prend en charge sous 2 min</Text>
+              <Text style={styles.actionDesc}>Assistance et numéros utiles</Text>
             </View>
             <Text style={{ color: Colors.muted, fontSize: 18 }}>›</Text>
           </TouchableOpacity>
@@ -148,16 +294,25 @@ export default function ClientIntrouvableScreen() {
       {/* Bottom */}
       <View style={styles.bottomArea}>
         <TouchableOpacity
-          style={[styles.cancelBtn, !canCancel && styles.cancelBtnDisabled]}
-          onPress={() => canCancel && navigation.navigate('DashboardEnLigne')}
-          activeOpacity={canCancel ? 0.85 : 1}
+          style={[styles.cancelBtn, (!canRelease || releasing) && styles.cancelBtnDisabled]}
+          onPress={release}
+          disabled={!canRelease || releasing}
+          activeOpacity={canRelease ? 0.85 : 1}
         >
-          <Text style={[styles.cancelBtnText, !canCancel && { opacity: 0.35 }]}>
-            {canCancel ? 'Annuler sans pénalité →' : `Annuler dans ${formatTime(remainSec)}`}
-          </Text>
+          {releasing ? (
+            <ActivityIndicator color={Colors.errorLight} />
+          ) : (
+            <Text style={[styles.cancelBtnText, !canRelease && { opacity: 0.35 }]}>
+              {canRelease
+                ? 'Signaler et libérer la course →'
+                : `Libération dans ${formatTime(remainSec)}`}
+            </Text>
+          )}
         </TouchableOpacity>
         <Text style={styles.bottomNote}>
-          Sans pénalité sur votre score si les conditions sont remplies
+          {REASON.blaming
+            ? 'Ce motif est retenu dans votre taux de fiabilité.'
+            : "« Client injoignable » n'est pas retenu contre vous. La course repart au dispatch et le support reçoit votre signalement."}
         </Text>
       </View>
     </SafeAreaView>
@@ -232,6 +387,14 @@ const styles = StyleSheet.create({
     fontFamily: 'Manrope_500Medium',
     textAlign: 'center',
     lineHeight: 22,
+  },
+  errorText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: Colors.errorLight,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    lineHeight: 20,
   },
   timerCard: {
     borderRadius: Radii.md,
@@ -370,6 +533,7 @@ const styles = StyleSheet.create({
     color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
     textAlign: 'center',
-    opacity: 0.6,
+    opacity: 0.7,
+    lineHeight: 18,
   },
 });

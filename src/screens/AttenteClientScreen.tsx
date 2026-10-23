@@ -1,6 +1,6 @@
 import React, { useCallback, useState } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity, Linking,
+  View, Text, StyleSheet, TouchableOpacity, Linking, ActivityIndicator,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useRoute, useFocusEffect } from '@react-navigation/native';
@@ -11,13 +11,29 @@ import { Alert } from '../components/AppAlert';
 export default function AttenteClientScreen() {
   const navigation = useNavigation<any>();
   const route = useRoute<any>();
-  const { orderId } = route.params ?? {};
+  // `deliveryId` circule jusqu'ici : sans lui, l'écran « client introuvable »
+  // ne peut pas libérer la course.
+  const { deliveryId, orderId } = route.params ?? {};
   const [order, setOrder] = useState<{ customer?: { name: string | null; phone: string } | null; deliveryAddress?: { line: string } } | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   useFocusEffect(useCallback(() => {
     let active = true;
-    if (!orderId) return;
-    getOrder(orderId).then((o: any) => { if (active) setOrder(o); }).catch(() => {});
+    if (!orderId) {
+      setLoading(false);
+      setError("Aucune commande n'a été transmise à cet écran.");
+      return;
+    }
+    setError(null);
+    getOrder(orderId)
+      .then((o: any) => { if (active) setOrder(o); })
+      .catch((e: any) => {
+        // Le chargement échouait en silence : le livreur voyait « Client »
+        // sans numéro et croyait à une commande sans téléphone.
+        if (active) setError(e?.message ?? 'Impossible de charger les informations du client.');
+      })
+      .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
   }, [orderId]));
 
@@ -68,19 +84,32 @@ export default function AttenteClientScreen() {
         {/* Client card */}
         <View style={styles.clientCard}>
           <View style={styles.clientAvatar}>
-            <Text style={{ fontSize: 28 }}>👤</Text>
+            {loading ? (
+              <ActivityIndicator color={Colors.cream} />
+            ) : (
+              <Text style={{ fontSize: 28 }}>👤</Text>
+            )}
           </View>
           <View style={styles.clientInfo}>
-            <Text style={styles.clientName}>{order?.customer?.name ?? 'Client'}</Text>
+            <Text style={styles.clientName}>
+              {loading ? 'Chargement…' : (order?.customer?.name ?? 'Client')}
+            </Text>
             <Text style={styles.clientAddress}>{order?.deliveryAddress?.line ?? ''}</Text>
           </View>
           <TouchableOpacity
-            style={styles.callBtn}
+            style={[styles.callBtn, (loading || !order?.customer?.phone) && styles.callBtnDisabled]}
             onPress={callClient}
+            disabled={loading}
           >
             <Text style={styles.callBtnIcon}>📞</Text>
           </TouchableOpacity>
         </View>
+
+        {error ? (
+          <View style={styles.errorBanner}>
+            <Text style={styles.errorBannerText}>{error}</Text>
+          </View>
+        ) : null}
 
         {/* Instructions steps */}
         <View style={styles.stepsCard}>
@@ -111,7 +140,7 @@ export default function AttenteClientScreen() {
       <View style={styles.bottomArea}>
         <TouchableOpacity
           style={styles.codeBtn}
-          onPress={() => navigation.replace('CodeConfirmationLivraison', { orderId })}
+          onPress={() => navigation.replace('CodeConfirmationLivraison', { deliveryId, orderId })}
           activeOpacity={0.85}
         >
           <Text style={styles.codeBtnText}>Saisir le code du client</Text>
@@ -119,7 +148,7 @@ export default function AttenteClientScreen() {
         </TouchableOpacity>
         <TouchableOpacity
           style={styles.problemBtn}
-          onPress={() => navigation.navigate('ClientIntrouvable')}
+          onPress={() => navigation.navigate('ClientIntrouvable', { deliveryId, orderId })}
         >
           <Text style={styles.problemBtnText}>Le client est introuvable</Text>
         </TouchableOpacity>
@@ -263,7 +292,24 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'center',
   },
+  callBtnDisabled: { opacity: 0.35 },
   callBtnIcon: { fontSize: 20 },
+  errorBanner: {
+    borderRadius: Radii.md,
+    backgroundColor: 'rgba(192,57,43,0.12)',
+    borderWidth: 1,
+    borderColor: 'rgba(255,180,171,0.3)',
+    paddingHorizontal: 16,
+    paddingVertical: 12,
+  },
+  errorBannerText: {
+    fontSize: 13,
+    fontWeight: '600',
+    color: Colors.errorLight,
+    fontFamily: 'Manrope_500Medium',
+    textAlign: 'center',
+    lineHeight: 20,
+  },
   stepsCard: {
     borderRadius: Radii.xl,
     backgroundColor: Colors.darkCard,

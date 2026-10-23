@@ -1,49 +1,107 @@
 import React, { useCallback, useState } from 'react';
 import {
   View, Text, StyleSheet, TouchableOpacity,
-  ScrollView, Dimensions, ActivityIndicator,
+  ScrollView, Dimensions, ActivityIndicator, Modal, RefreshControl,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation, useFocusEffect } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
 import BottomNavBar from '../components/BottomNavBar';
-import { getEarnings, getMyDeliveries, Earnings, CourierDelivery } from '../api/couriers';
-import { totalWithdrawn } from '../api/withdrawals';
+import { Alert } from '../components/AppAlert';
+import { getEarnings, Earnings } from '../api/couriers';
+import {
+  getWallet, listEntries, listPayouts,
+  Wallet, LedgerEntry, LedgerEntryType, Payout,
+  PAYOUT_STATUS_LABELS, PAYOUT_METHOD_LABELS, isSettled,
+} from '../api/wallet';
 
 const { width } = Dimensions.get('window');
 
 const fmt = (n: number) => n.toLocaleString('fr-FR');
 
+const fmtDate = (iso: string) =>
+  new Date(iso).toLocaleDateString('fr-FR', {
+    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit',
+  });
+
+/** Pictogramme par nature d'écriture, pour distinguer gain, reversement et retrait. */
+const ENTRY_ICONS: Record<LedgerEntryType, string> = {
+  DELIVERY_EARNING: '🏍️',
+  ORDER_SALE: '🧾',
+  PLATFORM_COMMISSION: '🏷️',
+  CASH_COLLECTED: '💵',
+  WITHDRAWAL: '💳',
+  WITHDRAWAL_REVERSAL: '↩️',
+  ADJUSTMENT: '⚖️',
+};
+
 export default function WalletScreen() {
   const navigation = useNavigation<any>();
+  const [wallet, setWallet] = useState<Wallet | null>(null);
   const [earnings, setEarnings] = useState<Earnings | null>(null);
-  const [recent, setRecent] = useState<CourierDelivery[]>([]);
-  const [withdrawn, setWithdrawn] = useState(0);
+  const [recent, setRecent] = useState<LedgerEntry[]>([]);
   const [loading, setLoading] = useState(true);
+  const [refreshing, setRefreshing] = useState(false);
+
+  // Historique des demandes de retrait : chargé à la demande, dans une modale,
+  // faute de route dédiée dans la navigation.
+  const [payoutsOpen, setPayoutsOpen] = useState(false);
+  const [payouts, setPayouts] = useState<Payout[] | null>(null);
+  const [payoutsLoading, setPayoutsLoading] = useState(false);
+
+  const load = useCallback(async (isActive: () => boolean) => {
+    // Le portefeuille fait foi pour le solde ; les gains du jour et de la
+    // semaine restent l'indicateur d'activité, ils ne s'additionnent pas.
+    const [w, e, entries] = await Promise.all([
+      getWallet(),
+      getEarnings().catch(() => null),
+      listEntries({ limit: 5 }).catch(() => ({ items: [], nextCursor: null })),
+    ]);
+    if (!isActive()) return;
+    setWallet(w);
+    setEarnings(e);
+    setRecent(entries.items);
+  }, []);
 
   useFocusEffect(useCallback(() => {
     let active = true;
-    Promise.all([getEarnings(), getMyDeliveries(), totalWithdrawn()])
-      .then(([e, d, wd]) => {
-        if (!active) return;
-        setEarnings(e);
-        // Seules les livraisons livrées ont généré un gain.
-        setRecent(d.filter((x) => x.status === 'DELIVERED').slice(0, 5));
-        setWithdrawn(wd);
+    const isActive = () => active;
+    load(isActive)
+      .catch((e: any) => {
+        if (active) Alert.alert('Portefeuille indisponible', e?.message ?? 'Réessayez dans un instant.');
       })
-      .catch(() => {})
       .finally(() => { if (active) setLoading(false); });
     return () => { active = false; };
-  }, []));
+  }, [load]));
 
-  const allTime = earnings?.allTime.totalXof ?? 0;
-  const balance = Math.max(0, allTime - withdrawn); // solde disponible
+  const onRefresh = useCallback(() => {
+    setRefreshing(true);
+    load(() => true)
+      .catch(() => {})
+      .finally(() => setRefreshing(false));
+  }, [load]);
+
+  const openPayouts = useCallback(() => {
+    setPayoutsOpen(true);
+    setPayoutsLoading(true);
+    listPayouts({ limit: 30 })
+      .then((res) => setPayouts(res.items))
+      .catch((e: any) => {
+        setPayoutsOpen(false);
+        Alert.alert('Historique indisponible', e?.message ?? 'Réessayez dans un instant.');
+      })
+      .finally(() => setPayoutsLoading(false));
+  }, []);
+
+  const balance = wallet?.balanceXof ?? 0;
+  const pending = wallet?.pendingXof ?? 0;
+  const pendingCount = wallet?.pendingPayoutCount ?? 0;
+  const lifetime = wallet?.lifetimeEarnedXof ?? 0;
   const weekTotal = earnings?.week.totalXof ?? 0;
   const todayTotal = earnings?.today.totalXof ?? 0;
 
   return (
     <SafeAreaView style={styles.container}>
-      {/* TopBar */}
       <View style={styles.topBar}>
         <Text style={styles.topBarTitle}>Mon Wallet</Text>
         <TouchableOpacity onPress={() => navigation.navigate('Transactions')}>
@@ -55,35 +113,60 @@ export default function WalletScreen() {
         style={styles.scrollArea}
         contentContainerStyle={styles.scrollContent}
         showsVerticalScrollIndicator={false}
+        refreshControl={
+          <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={Colors.goldLight} />
+        }
       >
-        {/* Balance card */}
+        {/* Solde du portefeuille serveur */}
         <View style={styles.balanceCard}>
           <View style={styles.balanceCardDecor} />
           <View style={styles.balanceCardDecor2} />
           <Text style={styles.balanceLabel}>SOLDE DISPONIBLE</Text>
           <Text style={styles.balanceValue}>{loading ? '—' : fmt(balance)}</Text>
           <Text style={styles.balanceCurrency}>FCFA</Text>
-          <View style={styles.balanceRow}>
-            <View style={styles.balanceStat}>
-              <Text style={styles.balanceStatLabel}>Aujourd'hui</Text>
-              <Text style={styles.balanceStatValue}>+{fmt(todayTotal)} FCFA</Text>
+
+          {earnings && (
+            <View style={styles.balanceRow}>
+              <View style={styles.balanceStat}>
+                <Text style={styles.balanceStatLabel}>Gagné aujourd'hui</Text>
+                <Text style={styles.balanceStatValue}>+{fmt(todayTotal)} FCFA</Text>
+              </View>
+              <View style={styles.balanceStatDivider} />
+              <View style={styles.balanceStat}>
+                <Text style={styles.balanceStatLabel}>Gagné cette semaine</Text>
+                <Text style={styles.balanceStatValue}>+{fmt(weekTotal)} FCFA</Text>
+              </View>
             </View>
-            <View style={styles.balanceStatDivider} />
-            <View style={styles.balanceStat}>
-              <Text style={styles.balanceStatLabel}>Cette semaine</Text>
-              <Text style={styles.balanceStatValue}>+{fmt(weekTotal)} FCFA</Text>
-            </View>
-          </View>
-          {/* Nombre de courses livrées */}
+          )}
+
           <View style={styles.paymentMethodBadge}>
-            <Text style={styles.paymentMethodIcon}>🏍️</Text>
+            <Text style={styles.paymentMethodIcon}>💰</Text>
             <Text style={styles.paymentMethodText}>
-              {earnings?.allTime.count ?? 0} course{(earnings?.allTime.count ?? 0) > 1 ? 's' : ''} livrée{(earnings?.allTime.count ?? 0) > 1 ? 's' : ''}
+              {loading ? 'Chargement…' : `${fmt(lifetime)} FCFA gagnés depuis le début`}
             </Text>
           </View>
         </View>
 
-        {/* Actions */}
+        {/* Ce qui est immobilisé par une demande en cours : ce n'est ni
+            disponible, ni encore versé. */}
+        {pendingCount > 0 && (
+          <TouchableOpacity style={styles.pendingCard} onPress={openPayouts} activeOpacity={0.85}>
+            <View style={styles.pendingLeft}>
+              <Text style={styles.pendingIcon}>⏳</Text>
+              <View style={styles.pendingText}>
+                <Text style={styles.pendingLabel}>En cours de versement</Text>
+                <Text style={styles.pendingSub}>
+                  {pendingCount} demande{pendingCount > 1 ? 's' : ''} en attente de traitement
+                </Text>
+              </View>
+            </View>
+            <View style={styles.pendingAmount}>
+              <Text style={styles.pendingAmountValue}>{fmt(pending)}</Text>
+              <Text style={styles.pendingAmountCurrency}>FCFA</Text>
+            </View>
+          </TouchableOpacity>
+        )}
+
         <View style={styles.actionsGrid}>
           <TouchableOpacity
             style={styles.actionCard}
@@ -93,8 +176,16 @@ export default function WalletScreen() {
             <View style={[styles.actionIconBg, { backgroundColor: Colors.goldLight }]}>
               <Text style={styles.actionIcon}>💸</Text>
             </View>
-            <Text style={styles.actionLabel}>Retirer</Text>
+            <Text style={styles.actionLabel}>Demander un retrait</Text>
             <Text style={styles.actionSub}>Wave / Orange Money</Text>
+          </TouchableOpacity>
+
+          <TouchableOpacity style={styles.actionCard} onPress={openPayouts} activeOpacity={0.85}>
+            <View style={[styles.actionIconBg, { backgroundColor: 'rgba(244,189,97,0.12)' }]}>
+              <Text style={styles.actionIcon}>📥</Text>
+            </View>
+            <Text style={styles.actionLabel}>Mes retraits</Text>
+            <Text style={styles.actionSub}>Suivi des demandes</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -105,8 +196,8 @@ export default function WalletScreen() {
             <View style={[styles.actionIconBg, { backgroundColor: 'rgba(169,208,182,0.2)' }]}>
               <Text style={styles.actionIcon}>📊</Text>
             </View>
-            <Text style={styles.actionLabel}>Transactions</Text>
-            <Text style={styles.actionSub}>Historique complet</Text>
+            <Text style={styles.actionLabel}>Relevé</Text>
+            <Text style={styles.actionSub}>Toutes les écritures</Text>
           </TouchableOpacity>
 
           <TouchableOpacity
@@ -114,47 +205,18 @@ export default function WalletScreen() {
             onPress={() => navigation.navigate('DetailsHebdos')}
             activeOpacity={0.85}
           >
-            <View style={[styles.actionIconBg, { backgroundColor: 'rgba(244,189,97,0.12)' }]}>
+            <View style={[styles.actionIconBg, { backgroundColor: 'rgba(255,180,171,0.12)' }]}>
               <Text style={styles.actionIcon}>📅</Text>
             </View>
             <Text style={styles.actionLabel}>Gains hebdos</Text>
-            <Text style={styles.actionSub}>Détails & bonus</Text>
-          </TouchableOpacity>
-
-          <TouchableOpacity
-            style={styles.actionCard}
-            onPress={() => navigation.navigate('Transactions')}
-            activeOpacity={0.85}
-          >
-            <View style={[styles.actionIconBg, { backgroundColor: 'rgba(255,180,171,0.12)' }]}>
-              <Text style={styles.actionIcon}>📄</Text>
-            </View>
-            <Text style={styles.actionLabel}>Reçus</Text>
-            <Text style={styles.actionSub}>Courses & paiements</Text>
+            <Text style={styles.actionSub}>Semaine par semaine</Text>
           </TouchableOpacity>
         </View>
 
-        {/* Gains de la semaine */}
-        <View style={styles.nextPayoutCard}>
-          <View style={styles.nextPayoutLeft}>
-            <Text style={styles.nextPayoutIcon}>📅</Text>
-            <View style={styles.nextPayoutText}>
-              <Text style={styles.nextPayoutLabel}>Cette semaine</Text>
-              <Text style={styles.nextPayoutDate}>
-                {earnings?.week.count ?? 0} course{(earnings?.week.count ?? 0) > 1 ? 's' : ''}
-              </Text>
-            </View>
-          </View>
-          <View style={styles.nextPayoutAmount}>
-            <Text style={styles.nextPayoutAmountValue}>{fmt(weekTotal)}</Text>
-            <Text style={styles.nextPayoutAmountCurrency}>FCFA</Text>
-          </View>
-        </View>
-
-        {/* Recent transactions */}
+        {/* Dernières écritures du relevé */}
         <View style={styles.recentSection}>
           <View style={styles.recentHeader}>
-            <Text style={styles.recentTitle}>RÉCENTS</Text>
+            <Text style={styles.recentTitle}>DERNIÈRES ÉCRITURES</Text>
             <TouchableOpacity onPress={() => navigation.navigate('Transactions')}>
               <Text style={styles.recentSeeAll}>Voir tout →</Text>
             </TouchableOpacity>
@@ -163,21 +225,24 @@ export default function WalletScreen() {
             {loading ? (
               <ActivityIndicator color={Colors.goldLight} style={{ paddingVertical: 20 }} />
             ) : recent.length === 0 ? (
-              <Text style={styles.emptyText}>Aucune course livrée pour le moment.</Text>
+              <Text style={styles.emptyText}>Aucun mouvement sur votre portefeuille.</Text>
             ) : (
-              recent.map((d) => (
-                <View key={d.id} style={styles.txItem}>
+              recent.map((entry) => (
+                <View key={entry.id} style={styles.txItem}>
                   <View style={styles.txIconBg}>
-                    <Text style={styles.txIcon}>🏍️</Text>
+                    <Text style={styles.txIcon}>{ENTRY_ICONS[entry.type] ?? '•'}</Text>
                   </View>
                   <View style={styles.txInfo}>
-                    <Text style={styles.txLabel} numberOfLines={1}>{d.order.restaurant.name}</Text>
-                    <Text style={styles.txDate}>
-                      {d.deliveredAt ? new Date(d.deliveredAt).toLocaleDateString('fr-FR', { day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit' }) : ''}
-                    </Text>
+                    <Text style={styles.txLabel} numberOfLines={1}>{entry.label}</Text>
+                    <Text style={styles.txDate}>{fmtDate(entry.createdAt)}</Text>
                   </View>
-                  <Text style={[styles.txAmount, { color: Colors.successDark }]}>
-                    +{fmt(d.order.deliveryFee)} FCFA
+                  <Text
+                    style={[
+                      styles.txAmount,
+                      { color: entry.amountXof >= 0 ? Colors.successDark : Colors.errorLight },
+                    ]}
+                  >
+                    {entry.amountXof >= 0 ? '+' : '−'}{fmt(Math.abs(entry.amountXof))} FCFA
                   </Text>
                 </View>
               ))
@@ -185,6 +250,70 @@ export default function WalletScreen() {
           </View>
         </View>
       </ScrollView>
+
+      {/* Historique des demandes de retrait */}
+      <Modal
+        visible={payoutsOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => setPayoutsOpen(false)}
+      >
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalCard}>
+            <View style={styles.modalHeader}>
+              <Text style={styles.modalTitle}>Mes demandes de retrait</Text>
+              <TouchableOpacity onPress={() => setPayoutsOpen(false)} style={styles.modalClose}>
+                <Text style={styles.modalCloseText}>✕</Text>
+              </TouchableOpacity>
+            </View>
+
+            {payoutsLoading ? (
+              <ActivityIndicator color={Colors.goldLight} style={{ paddingVertical: 32 }} />
+            ) : !payouts?.length ? (
+              <Text style={styles.emptyText}>Vous n'avez encore demandé aucun retrait.</Text>
+            ) : (
+              <ScrollView style={styles.modalList} showsVerticalScrollIndicator={false}>
+                <View style={{ gap: 8 }}>
+                  {payouts.map((p) => (
+                    <View key={p.id} style={styles.payoutItem}>
+                      <View style={styles.payoutTop}>
+                        <Text style={styles.payoutAmount}>{fmt(p.amountXof)} FCFA</Text>
+                        <View
+                          style={[
+                            styles.payoutBadge,
+                            isSettled(p.status) && p.status !== 'PAID' && styles.payoutBadgeMuted,
+                            p.status === 'PAID' && styles.payoutBadgePaid,
+                          ]}
+                        >
+                          <Text style={styles.payoutBadgeText}>{PAYOUT_STATUS_LABELS[p.status]}</Text>
+                        </View>
+                      </View>
+                      <Text style={styles.payoutMeta}>
+                        {PAYOUT_METHOD_LABELS[p.method]} · {p.destination}
+                      </Text>
+                      <Text style={styles.payoutMeta}>
+                        Demandé le {fmtDate(p.createdAt)}
+                        {p.paidAt ? ` · versé le ${fmtDate(p.paidAt)}` : ''}
+                      </Text>
+                      {p.feeXof > 0 && (
+                        <Text style={styles.payoutMeta}>
+                          Frais {fmt(p.feeXof)} FCFA · net {fmt(p.netXof)} FCFA
+                        </Text>
+                      )}
+                      {!!p.reference && (
+                        <Text style={styles.payoutMeta}>Référence {p.reference}</Text>
+                      )}
+                      {!!p.rejectionReason && (
+                        <Text style={styles.payoutReason}>{p.rejectionReason}</Text>
+                      )}
+                    </View>
+                  ))}
+                </View>
+              </ScrollView>
+            )}
+          </View>
+        </View>
+      </Modal>
 
       <BottomNavBar active="gains" homeScreen="DashboardEnLigne" />
     </SafeAreaView>
@@ -201,8 +330,6 @@ const styles = StyleSheet.create({
     justifyContent: 'space-between',
     paddingHorizontal: 24,
   },
-  backBtn: { width: 34, height: 28, justifyContent: 'center' },
-  backArrow: { fontSize: 22, color: Colors.cream, fontWeight: '600' },
   topBarTitle: {
     fontSize: 18,
     fontWeight: '700',
@@ -313,13 +440,44 @@ const styles = StyleSheet.create({
     fontWeight: '500',
     color: Colors.cream,
     fontFamily: 'Manrope_500Medium',
-    flex: 1,
   },
-  paymentMethodStatus: {
-    fontSize: 11,
+  pendingCard: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    borderRadius: Radii.md,
+    backgroundColor: 'rgba(244,189,97,0.08)',
+    borderWidth: 1,
+    borderColor: 'rgba(244,189,97,0.2)',
+    padding: 16,
+  },
+  pendingLeft: { flexDirection: 'row', alignItems: 'center', gap: 12, flex: 1 },
+  pendingIcon: { fontSize: 24 },
+  pendingText: { gap: 2, flex: 1 },
+  pendingLabel: {
+    fontSize: 14,
     fontWeight: '700',
-    color: Colors.successDark,
+    color: Colors.goldLight,
     fontFamily: 'Manrope_500Medium',
+  },
+  pendingSub: {
+    fontSize: 12,
+    fontWeight: '400',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+  },
+  pendingAmount: { alignItems: 'flex-end' },
+  pendingAmountValue: {
+    fontSize: 20,
+    fontWeight: '900',
+    color: Colors.goldLight,
+    fontFamily: 'Manrope_500Medium',
+  },
+  pendingAmountCurrency: {
+    fontSize: 12,
+    color: Colors.goldLight,
+    fontFamily: 'Manrope_500Medium',
+    opacity: 0.7,
   },
   actionsGrid: {
     flexDirection: 'row',
@@ -355,49 +513,6 @@ const styles = StyleSheet.create({
     fontWeight: '400',
     color: Colors.muted,
     fontFamily: 'Manrope_500Medium',
-  },
-  nextPayoutCard: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    borderRadius: Radii.md,
-    backgroundColor: 'rgba(244,189,97,0.08)',
-    borderWidth: 1,
-    borderColor: 'rgba(244,189,97,0.2)',
-    padding: 16,
-  },
-  nextPayoutLeft: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    gap: 12,
-  },
-  nextPayoutIcon: { fontSize: 24 },
-  nextPayoutText: { gap: 2 },
-  nextPayoutLabel: {
-    fontSize: 12,
-    fontWeight: '500',
-    color: Colors.goldLight,
-    fontFamily: 'Manrope_500Medium',
-    opacity: 0.8,
-  },
-  nextPayoutDate: {
-    fontSize: 14,
-    fontWeight: '700',
-    color: Colors.goldLight,
-    fontFamily: 'Manrope_500Medium',
-  },
-  nextPayoutAmount: { alignItems: 'flex-end' },
-  nextPayoutAmountValue: {
-    fontSize: 20,
-    fontWeight: '900',
-    color: Colors.goldLight,
-    fontFamily: 'Manrope_500Medium',
-  },
-  nextPayoutAmountCurrency: {
-    fontSize: 12,
-    color: Colors.goldLight,
-    fontFamily: 'Manrope_500Medium',
-    opacity: 0.7,
   },
   recentSection: { gap: 12 },
   recentHeader: {
@@ -462,5 +577,86 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: '800',
     fontFamily: 'Manrope_500Medium',
+  },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: 'rgba(0,0,0,0.65)',
+    justifyContent: 'flex-end',
+  },
+  modalCard: {
+    maxHeight: '82%',
+    backgroundColor: Colors.cardDark,
+    borderTopLeftRadius: Radii.xxl,
+    borderTopRightRadius: Radii.xxl,
+    padding: 24,
+    gap: 16,
+  },
+  modalHeader: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  modalTitle: {
+    fontSize: 18,
+    fontWeight: '800',
+    color: Colors.greenLight,
+    fontFamily: 'Manrope_500Medium',
+  },
+  modalClose: {
+    width: 36,
+    height: 36,
+    borderRadius: 18,
+    backgroundColor: 'rgba(169,208,182,0.1)',
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  modalCloseText: { fontSize: 16, color: Colors.gold, fontWeight: '700' },
+  modalList: { flexGrow: 0 },
+  payoutItem: {
+    borderRadius: Radii.md,
+    backgroundColor: Colors.darkCard,
+    borderWidth: 1,
+    borderColor: 'rgba(65,72,67,0.4)',
+    padding: 14,
+    gap: 4,
+  },
+  payoutTop: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    gap: 10,
+  },
+  payoutAmount: {
+    fontSize: 18,
+    fontWeight: '900',
+    color: Colors.goldLight,
+    fontFamily: 'Manrope_500Medium',
+  },
+  payoutBadge: {
+    borderRadius: 9999,
+    paddingHorizontal: 10,
+    paddingVertical: 4,
+    backgroundColor: 'rgba(244,189,97,0.15)',
+  },
+  payoutBadgeMuted: { backgroundColor: 'rgba(255,180,171,0.15)' },
+  payoutBadgePaid: { backgroundColor: 'rgba(39,174,96,0.2)' },
+  payoutBadgeText: {
+    fontSize: 11,
+    fontWeight: '700',
+    color: Colors.cream,
+    fontFamily: 'Manrope_500Medium',
+  },
+  payoutMeta: {
+    fontSize: 12,
+    fontWeight: '400',
+    color: Colors.muted,
+    fontFamily: 'Manrope_500Medium',
+  },
+  payoutReason: {
+    fontSize: 12,
+    fontWeight: '600',
+    color: Colors.errorLight,
+    fontFamily: 'Manrope_500Medium',
+    marginTop: 2,
   },
 });

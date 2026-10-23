@@ -1,13 +1,18 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
-  View, Text, StyleSheet, TouchableOpacity,
-  Dimensions, FlatList, Animated,
+  View, Text, StyleSheet, TouchableOpacity, Dimensions,
 } from 'react-native';
+import AsyncStorage from '@react-native-async-storage/async-storage';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useNavigation } from '@react-navigation/native';
 import { Colors, Radii } from '../constants/theme';
 
-const { width, height } = Dimensions.get('window');
+const { height } = Dimensions.get('window');
+
+// L'accueil n'a de sens qu'une seule fois : l'indicateur est local à
+// l'appareil (même motif que ignoredDeliveries.ts), le serveur n'a pas à le
+// connaître. Une réinstallation le rejoue, ce qui est acceptable.
+const ONBOARDING_SEEN_KEY = '@malaw-livreur/onboardingSeen';
 
 const SLIDES = [
   {
@@ -38,7 +43,7 @@ const SLIDES = [
     key: '3',
     emoji: '📦',
     badge: 'ÉTAPE 2',
-    title: 'Récupérez &\nliv rez en sécurité',
+    title: 'Récupérez &\nlivrez en sécurité',
     desc: 'Naviguez jusqu\'au restaurant, confirmez la prise en charge, puis livrez au client avec un code de validation.',
     bg: Colors.deepBlack,
     textColor: Colors.greenLight,
@@ -50,8 +55,8 @@ const SLIDES = [
     key: '4',
     emoji: '💰',
     badge: 'ÉTAPE 3',
-    title: 'Soyez payé\nchaque semaine',
-    desc: 'Vos gains sont crédités chaque lundi sur votre compte Wave ou Orange Money. Suivez vos revenus en temps réel.',
+    title: 'Gagnez à\nchaque course',
+    desc: 'Vos gains sont crédités à chaque course livrée. Vous demandez un retrait quand vous voulez, dès 1 000 FCFA, sur Wave ou Orange Money.',
     bg: Colors.darkGreen,
     textColor: Colors.cream,
     accentColor: Colors.goldLight,
@@ -63,20 +68,48 @@ const SLIDES = [
 export default function OnboardingScreen() {
   const navigation = useNavigation<any>();
   const [current, setCurrent] = useState(0);
-  const flatRef = useRef<FlatList>(null);
+  // Tant qu'on ne sait pas si l'accueil a déjà été vu, on n'affiche rien :
+  // sinon la première diapositive clignote avant la redirection.
+  const [checking, setChecking] = useState(true);
+
+  useEffect(() => {
+    let cancelled = false;
+    AsyncStorage.getItem(ONBOARDING_SEEN_KEY)
+      .then((seen) => {
+        if (cancelled) return;
+        if (seen === '1') {
+          navigation.reset({ index: 0, routes: [{ name: 'DashboardEnLigne' }] });
+        } else {
+          setChecking(false);
+        }
+      })
+      // Stockage indisponible : on montre l'accueil plutôt que de bloquer.
+      .catch(() => { if (!cancelled) setChecking(false); });
+    return () => { cancelled = true; };
+  }, [navigation]);
+
+  const finish = async () => {
+    // L'échec d'écriture ne doit pas empêcher d'entrer dans l'app : au pire
+    // l'accueil sera revu au prochain lancement.
+    try { await AsyncStorage.setItem(ONBOARDING_SEEN_KEY, '1'); } catch {}
+    navigation.reset({ index: 0, routes: [{ name: 'DashboardEnLigne' }] });
+  };
 
   const goNext = () => {
     if (current < SLIDES.length - 1) {
-      flatRef.current?.scrollToIndex({ index: current + 1, animated: true });
       setCurrent(c => c + 1);
     } else {
-      navigation.reset({ index: 0, routes: [{ name: 'DashboardEnLigne' }] });
+      finish();
     }
   };
 
-  const skip = () => navigation.reset({ index: 0, routes: [{ name: 'DashboardEnLigne' }] });
+  const skip = () => { finish(); };
 
   const slide = SLIDES[current];
+
+  if (checking) {
+    return <SafeAreaView style={[styles.container, { backgroundColor: SLIDES[0].bg }]} />;
+  }
 
   return (
     <SafeAreaView style={[styles.container, { backgroundColor: slide.bg }]}>
@@ -102,7 +135,8 @@ export default function OnboardingScreen() {
         <View style={{ width: 56 }} />
       </View>
 
-      {/* Slide content (manual, not FlatList to keep background responsive) */}
+      {/* Diapositive rendue directement : le fond de l'écran change avec elle,
+          ce qu'une liste défilante ne permettrait pas proprement. */}
       <View style={styles.slideContent}>
         {/* Illustration */}
         <View style={styles.illustrationArea}>
